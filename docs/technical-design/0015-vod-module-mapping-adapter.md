@@ -173,7 +173,7 @@ Additive: with no `dialect` the HTTP resolver is unchanged, and rollback is remo
 
 ## Implementation status
 
-Stage 1 (the two additions to the answer model) is implemented. The translator and the dialect (stages 2 and 3) are not. What differs from the design above, or settles it:
+Stages 1 to 3 are implemented: the two additions to the answer model, the translator (`src/resolver/vod_module.rs`), and the dialect of the HTTP resolver. The translator is checked against the documented format only. What differs from the design above, or settles it:
 
 - **`tracks` and the version.** It is mixed into the version of the asset, and of a clip, only when set, and in one spelling, so `a1-v1` and `v1-a1` are the same asset and an asset that serves every track keeps the version it always had. The `tracks` on the answer as a whole is for a single file; with `renditions` or `clips` it is rejected with a message saying where it goes.
 - **Selected audio** is renumbered in file order. The selection is applied before a protected source's keys are looked up, so it works with [encrypted sources](0014-encrypted-source-files.md).
@@ -182,7 +182,8 @@ Stage 1 (the two additions to the answer model) is implemented. The translator a
 - **Reload.** A change to any of these under an unchanged mapper `version` reloads the asset, as re-keying does.
 - **A clip's selection is applied before the clip is cut**, so the window is placed on the tracks that are served. (The first version applied it after, and a short track the clip dropped could fail a window the kept tracks satisfy; a review found it.)
 - **Known and deferred:** two renditions with the same `label` give two HLS audio members with the same `NAME`, which RFC 8216 forbids; overrides on a video rendition whose audio is not in the group are accepted and have no effect (logged nowhere). Both are for the translator stage to decide.
-- **Not done in this stage:** a one-element `renditions` answer for a single file with overrides (the translator builds it), and a `default` flag on a rendition whose audio is not in the group has no effect.
+- **Stages 2 and 3.** The translator is a pure function from the mapping to a native answer; the HTTP resolver serialises that and runs the usual parse and `interpret`. Settled while building it: the version is `vm1-` plus 32 hex digits of a SHA-256 over the answer with URL queries removed, with the size and modification time of each local file mixed in by the resolver; `ignore` relaxes only the refusal of a field, never of a clip type or a structural rule; a field the translator does not know is refused; `cache: false` becomes the shortest reuse window; several sequences that each have several clips stay refused until [TDD 0016](0016-adaptive-clips.md) is wired in (its native form, `renditions` with `clips`, already exists). Not done: `health_url` has no test against a live service, and no real mapping response has been tried.
+- **Not done in stage 1:** a one-element `renditions` answer for a single file with overrides (the translator builds it), and a `default` flag on a rendition whose audio is not in the group has no effect.
 
 ## Open questions
 

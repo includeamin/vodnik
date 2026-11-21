@@ -24,6 +24,8 @@ use crate::testutil::{
 
 fn mapper_settings(url: &str) -> MapperConfig {
     MapperConfig {
+        dialect: crate::config::Dialect::Native,
+        vod_module: Box::default(),
         base_url: url.to_owned(),
         bearer_token: None,
         bearer_token_file: None,
@@ -6713,4 +6715,128 @@ async fn the_init_segment_of_a_second_audio_rendition_is_served() {
         .await;
         assert_eq!(segment, StatusCode::OK, "{protocol} audio-2 segment");
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The nginx-vod-module dialect of the mapper client (TDD 0015)
+// ---------------------------------------------------------------------------------------------
+
+async fn vod_module_harness() -> Harness {
+    harness_with(|config| {
+        config.hls_mux_audio = false;
+        let ResolverSettings::Http(mapper) = &mut config.resolver else {
+            panic!("the harness uses the http resolver");
+        };
+        mapper.dialect = crate::config::Dialect::VodModule;
+        mapper.vod_module.path_template = "vod/{id}".to_owned();
+        mapper.vod_module.file_root = Some("/data/media".to_owned());
+    })
+    .await
+}
+
+fn playlist_without_version(playlist: &str) -> String {
+    playlist
+        .lines()
+        .map(|line| line.split("?v=").next().unwrap_or(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[tokio::test]
+async fn a_vod_module_mapping_is_served_like_the_same_asset_in_the_native_answer() {
+    let h = vod_module_harness().await;
+    h.mapper.state.set(
+        "native",
+        Answer::file("v1", "h264-aac-two-audio.mp4").with_tracks("v1-a2"),
+    );
+    // The same asset, as nginx-vod-module's mapping service would describe it.
+    *h.mapper.state.raw_body.lock().unwrap() = Some(
+        serde_json::json!({"sequences": [{"clips": [{
+            "type": "source", "path": "/data/media/h264-aac-two-audio.mp4", "tracks": "v1-a2"}]}]})
+        .to_string(),
+    );
+    let (code, _, master) = fetch(&h.app, "/hls/native/master.m3u8").await;
+    assert_eq!(code, StatusCode::OK);
+    let native = playlist_without_version(&text(&master));
+    h.mapper.state.remove("native");
+
+    let (code, _, master) = fetch(&h.app, "/hls/native/master.m3u8").await;
+    assert_eq!(code, StatusCode::OK, "{}", text(&master));
+    assert_eq!(playlist_without_version(&text(&master)), native);
+    assert_eq!(audio_lines(&text(&master)).len(), 1);
+}
+
+#[tokio::test]
+async fn a_mapping_vodnik_cannot_honor_is_refused_naming_the_field() {
+    let h = vod_module_harness().await;
+    *h.mapper.state.raw_body.lock().unwrap() = Some(
+        serde_json::json!({"notifications": [], "sequences": [{"clips": [{
+            "type": "source", "path": "/data/media/h264-aac.mp4"}]}]})
+        .to_string(),
+    );
+    let (code, _, body) = fetch(&h.app, "/hls/movie/master.m3u8").await;
+    assert_eq!(code, StatusCode::BAD_GATEWAY);
+    // The reason is logged; a client only ever sees the generic gateway error.
+    assert_eq!(text(&body), "bad gateway");
+}
+
+#[tokio::test]
+async fn the_dialect_asks_for_the_mapping_unconditionally() {
+    let h = vod_module_harness().await;
+    *h.mapper.state.raw_body.lock().unwrap() = Some(
+        serde_json::json!({"sequences": [{"clips": [{
+            "type": "source", "path": "/data/media/h264-aac.mp4"}]}], "cache": false})
+        .to_string(),
+    );
+    assert_eq!(
+        status(&h.app, "/hls/movie/master.m3u8").await,
+        StatusCode::OK
+    );
+    // `cache: false` gives the shortest reuse window the configuration allows.
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    assert_eq!(
+        status(&h.app, "/hls/movie/master.m3u8").await,
+        StatusCode::OK
+    );
+    assert!(h.mapper.state.calls() >= 2);
+    assert!(
+        h.mapper
+            .state
+            .conditions
+            .lock()
+            .unwrap()
+            .iter()
+            .all(Option::is_none),
+        "a mapping service has no ETag to send back"
+    );
+}
+
+#[tokio::test]
+async fn the_status_reports_the_dialect() {
+    let h = vod_module_harness().await;
+    assert_eq!(
+        h.state.registry.status().await.resolver.dialect,
+        Some("vod-module")
+    );
+    assert_eq!(
+        harness()
+            .await
+            .state
+            .registry
+            .status()
+            .await
+            .resolver
+            .dialect,
+        Some("native")
+    );
+}
+
+#[tokio::test]
+async fn a_missing_mapping_is_a_missing_asset() {
+    let h = vod_module_harness().await;
+    h.mapper.state.forced_status.store(404, Ordering::SeqCst);
+    assert_eq!(
+        status(&h.app, "/hls/nothing/master.m3u8").await,
+        StatusCode::NOT_FOUND
+    );
 }

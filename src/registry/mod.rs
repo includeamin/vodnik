@@ -68,6 +68,8 @@ pub(crate) struct RegistryStatus {
 #[derive(Debug)]
 pub(crate) struct ResolverStatus {
     pub(crate) kind: &'static str,
+    /// What the mapper speaks (`native` or `vod-module`); `None` for the static catalog.
+    pub(crate) dialect: Option<&'static str>,
     pub(crate) healthy: bool,
     /// The mapper's base URL; `None` for the static catalog.
     pub(crate) base_url: Option<String>,
@@ -318,6 +320,7 @@ impl AssetRegistry {
         RegistryStatus {
             resolver: ResolverStatus {
                 kind: self.resolver.kind(),
+                dialect: self.resolver.dialect(),
                 healthy,
                 base_url: self.resolver.base_url().map(str::to_owned),
                 known_assets,

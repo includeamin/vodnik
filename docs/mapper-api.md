@@ -471,6 +471,31 @@ What a player sees:
 - **Not together with `encryption`:** an answer that sets both, or sets `hls_aes128` with a clip's own `encryption`, is rejected. `hls_aes128` sits on the answer and covers every rendition of an adaptive asset and every clip of a sequence, under the one key. A segment's IV is its media sequence number in the playlist, which counts across the clips of a sequence.
 - **The answer carries a secret.** The same rules as for `encryption` apply: use `https` and the bearer token. Errors name the field and never the key. The key and its URI are part of the URL version, so changing either gives new URLs.
 
+## Reading an nginx-vod-module mapping service
+
+A deployment that already has a mapping service for nginx-vod-module can point vodnik at it unchanged. Set `dialect = "vod-module"` under `[resolver.http]`. vodnik then asks `{base_url}/{path_template}?{extra_args}` (the default `path_template` is `{id}`, and `{id}` is the percent-encoded asset ID), translates the JSON media set into the answer described on this page, and validates that exactly as it would a native answer. The design is [TDD 0015](technical-design/0015-vod-module-mapping-adapter.md).
+
+```toml
+[resolver.http]
+base_url = "https://mapping.internal.example.net"
+dialect = "vod-module"
+
+[resolver.http.vod_module]
+path_template = "vod/{id}"
+extra_args = "key=abc"                          # vod_upstream_extra_args
+host_header = "mapping.example"                 # vod_upstream_host_header
+file_root = "/data/media"                       # removed from a source `path`; the rest is relative to storage.media_root
+remote_base_url = "https://origin.example.net"  # where `sourceType: http` paths live
+health_url = ""                                 # absent means the service is assumed healthy
+ignore = []                                     # fields to accept and drop instead of refusing
+```
+
+What is translated: one file; several sequences as renditions (with `language`, `label` and `default`); a sequence of clips with `durations` and `clipFrom`; `concat` clips; set-level `clipFrom` and `clipTo` on a single file; `tracks` (default `v1-a1`, as in nginx-vod-module); and sequences whose file ends `.vtt`, `.srt`, `.ttml` or `.dfxp` as subtitles.
+
+What is refused, with the JSON path in the error and never a value: live fields and any `playlistType` other than `vod`; `rateFilter`, `gainFilter`, `mixFilter`, `silence` and `dynamic` clips; `clipIds`, `notifications` and `closedCaptions`; a source's `encryptionKey`, `encryptionIv` and `encryptionScheme`; a concat `offset` other than 0; a `segmentDuration` that differs from `packaging.segment_duration_ms`; and several sequences that each have several clips (adaptive playlists, not translated yet). A field the translation does not know is refused too. `ignore` accepts a JSON path or a bare field name and only relaxes a refusal of a field, never of a clip type.
+
+The mapping has no version, so vodnik makes one from what decides the output: the locations (a URL without its query, so a re-signed URL does not reload the asset), windows, tracks, overrides and subtitles, plus the size and modification time of every local file. The service has no ETag, so every revalidation fetches the mapping again and nothing is reloaded when the version is unchanged. `"cache": false` in a mapping gives it the shortest reuse window, `min_ttl_ms`. A `404` is a missing asset. The service cannot list its assets, so the admin panel shows only what is loaded, and `/admin/status` reports the `dialect`.
+
 ## What a `version` means to the server
 
 The server keeps one loaded copy per asset, keyed by `(asset_id, version)`. A different `version`, or the same version at a different location (a rotated signed URL), makes it reload from the new location. There is **no grace period**: players holding URLs from the old version get `404` and recover by fetching the playlist again. Change `version` only when the media actually changes.

@@ -21,6 +21,8 @@ struct StatusResponse {
 struct ResolverJson {
     /// `"static"` (the configuration-file catalog) or `"mapper"`.
     kind: &'static str,
+    /// What the mapper speaks, `native` or `vod-module`; `null` for the static catalog.
+    dialect: Option<&'static str>,
     /// Checked right now, not read from the background probe: accurate even when
     /// `readiness_probe_interval_ms` is `0`.
     healthy: bool,
@@ -61,6 +63,7 @@ impl From<RegistryStatus> for StatusResponse {
         Self {
             resolver: ResolverJson {
                 kind: status.resolver.kind,
+                dialect: status.resolver.dialect,
                 healthy: status.resolver.healthy,
                 base_url: status.resolver.base_url,
                 known_assets: status.resolver.known_assets,
@@ -114,6 +117,7 @@ mod tests {
         let response = StatusResponse {
             resolver: ResolverJson {
                 kind: "mapper",
+                dialect: Some("native"),
                 healthy: true,
                 base_url: Some("https://mapper.internal".to_owned()),
                 known_assets: None,

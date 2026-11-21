@@ -95,6 +95,15 @@ path = "h264-aac.mp4"
 # refresh_margin_ms = 30000               # refresh signed locations this long before expires_at
 # readiness_probe_interval_ms = 0         # >0: /ready reports 503 while the mapper is unreachable
 #
+# To read an nginx-vod-module mapping service unchanged instead of the native mapper API:
+# dialect = "vod-module"
+# [resolver.http.vod_module]
+# path_template = "vod/{id}"              # after base_url; {id} is the asset ID
+# extra_args = "key=abc"                  # vod_upstream_extra_args
+# file_root = "/data/media"               # removed from a source path; the rest is relative to media_root
+# remote_base_url = "https://origin.example.net"   # where `sourceType: http` paths live
+# ignore = []                             # fields to accept and drop instead of refusing
+#
 # [registry]
 # max_cached_resolutions = 10000
 # load_queue_timeout_ms = 5000
