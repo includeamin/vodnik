@@ -823,12 +823,6 @@ impl HttpResolver {
         if !wire.subtitles.is_empty() {
             return refuse("subtitles");
         }
-        if wire.encryption.is_some() {
-            return refuse("encryption");
-        }
-        if wire.hls_aes128.is_some() {
-            return refuse("hls_aes128");
-        }
         if wire.source_encryption.is_some() {
             return refuse("source_encryption");
         }
@@ -846,6 +840,26 @@ impl HttpResolver {
                 "rendition `{id}`: clip {position}: encryption is not supported yet with \
                  renditions that have clips (TDD 0016)"
             )));
+        }
+        Ok(())
+    }
+
+    /// Key periods are for a single file or a ladder; with clips, of either kind, they wait for
+    /// stage 3 of TDD 0016.
+    fn refuse_rotation_with_clips(
+        encryption: Option<&crate::cenc::Encryption>,
+        clips: &[ClipLocation],
+        renditions: &[RenditionLocation],
+    ) -> Result<(), ResolveError> {
+        let rendition_clips = renditions
+            .iter()
+            .any(|rendition| matches!(rendition.source, RenditionSource::Clips(_)));
+        if encryption.is_some_and(crate::cenc::Encryption::is_rotating)
+            && (!clips.is_empty() || rendition_clips)
+        {
+            return Err(ResolveError::Rejected(
+                "encryption periods cannot be combined with clips".to_owned(),
+            ));
         }
         Ok(())
     }
@@ -911,11 +925,7 @@ impl HttpResolver {
         let encryption =
             Self::interpret_encryption(wire.encryption.as_ref()).map_err(ResolveError::Rejected)?;
         // Stage 2 of TDD 0013: a single file or every rendition of one; not yet clips.
-        if encryption.as_ref().is_some_and(|e| e.is_rotating()) && !clips.is_empty() {
-            return Err(ResolveError::Rejected(
-                "encryption periods cannot be combined with clips".to_owned(),
-            ));
-        }
+        Self::refuse_rotation_with_clips(encryption.as_deref(), &clips, &renditions)?;
         let hls_aes128 = wire
             .hls_aes128
             .as_ref()
@@ -1206,20 +1216,21 @@ mod tests {
     }
 
     #[test]
-    fn stage_one_refuses_encryption_and_subtitles_with_rendition_clips() {
+    fn stage_three_features_are_still_refused_with_rendition_clips() {
         let base = || answer(&[clips_rendition("a", &["x.mp4"])]);
         let encryption = json!({
             "scheme": "cbcs",
             "keys": [{ "key_id": KEY_ID, "key": KEY }],
             "systems": [{ "system_id": "e2719d58-a985-b3c9-781a-b030af78d30e", "license_url": "https://l.example.net/ck" }],
         });
-        let mut cases = Vec::new();
-        let mut answer_encryption = base();
-        answer_encryption["encryption"] = encryption.clone();
-        cases.push(("encryption", answer_encryption));
+        // Whole-asset `encryption` and `hls_aes128` are accepted (stage 2).
+        let mut whole = base();
+        whole["encryption"] = encryption.clone();
+        assert!(interpret(&resolver(64, 256), &whole).is_ok());
         let mut aes128 = base();
         aes128["hls_aes128"] = json!({ "key": KEY, "key_uri": "https://keys.example.com/k" });
-        cases.push(("hls_aes128", aes128));
+        assert!(interpret(&resolver(64, 256), &aes128).is_ok());
+        let mut cases = Vec::new();
         let mut source = base();
         source["source_encryption"] = json!({ "keys": [{ "key_id": KEY_ID, "key": KEY }] });
         cases.push(("source_encryption", source));

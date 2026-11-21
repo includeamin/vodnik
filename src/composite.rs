@@ -43,8 +43,7 @@ impl ServedAsset {
                 .encryption()
                 .map(crate::cenc::Encryption::key_ids),
             Self::Sequence(asset) => asset.key_ids(),
-            // Stage 1 of TDD 0016 serves clear content only.
-            Self::AdaptiveSequence(_) => None,
+            Self::AdaptiveSequence(asset) => asset.key_ids(),
         }
     }
 
@@ -236,7 +235,7 @@ impl ServedAsset {
             Self::Single(asset) => asset.is_aes128(),
             Self::Composite(asset) => asset.video[0].asset.is_aes128(),
             Self::Sequence(asset) => asset.is_aes128(),
-            Self::AdaptiveSequence(_) => false,
+            Self::AdaptiveSequence(asset) => asset.is_aes128(),
         }
     }
 
