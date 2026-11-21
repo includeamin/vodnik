@@ -6895,3 +6895,155 @@ async fn a_vod_module_adaptive_playlist_is_served_like_the_native_adaptive_clips
     let manifest = text(&fetch(&h.app, "/dash/grid/manifest.mpd").await.2);
     assert_eq!(manifest.matches("<Period ").count(), 2, "{manifest}");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Encrypted adaptive clips (TDD 0016, stage 2)
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_encrypted_adaptive_clips_answer_serves_protected_content() {
+    let h = harness().await;
+    h.mapper.state.set(
+        "grid",
+        two_clip_ladder("v1").with_encryption(clear_key_encryption(KEY)),
+    );
+    let master = fetch(&h.app, "/hls/grid/master.m3u8").await;
+    assert_eq!(master.0, StatusCode::OK, "{}", text(&master.2));
+    let version = version_in(&master.2);
+
+    for track in ["video-720p", "video-480p", "audio-1"] {
+        let playlist = text(
+            &fetch(&h.app, &format!("/hls/grid/{track}/index.m3u8"))
+                .await
+                .2,
+        );
+        assert!(
+            playlist.contains(r#"KEYFORMAT="org.w3.clearkey""#),
+            "{track}: {playlist}"
+        );
+        assert_eq!(playlist.matches("#EXT-X-MAP").count(), 2, "{track}");
+    }
+    for (track, marker) in [
+        ("video-720p", &b"encv"[..]),
+        ("video-480p", &b"encv"[..]),
+        ("audio-1", &b"enca"[..]),
+    ] {
+        for clip in 0..2 {
+            let init = fetch(
+                &h.app,
+                &format!("/hls/grid/{track}/clips/{clip}/init.mp4?v={version}"),
+            )
+            .await;
+            assert_eq!(init.0, StatusCode::OK, "{track} clip {clip}");
+            assert!(
+                init.2.windows(4).any(|w| w == marker) && init.2.windows(4).any(|w| w == b"tenc"),
+                "{track} clip {clip} init is protected"
+            );
+        }
+    }
+    let segment = fetch(
+        &h.app,
+        &format!("/hls/grid/video-720p/segments/1/media.m4s?v={version}"),
+    )
+    .await;
+    assert_eq!(segment.0, StatusCode::OK);
+    assert!(
+        segment.2.windows(4).any(|w| w == b"senc"),
+        "the fragment is encrypted"
+    );
+
+    // The status endpoint lists the key IDs, never the keys.
+    let json: serde_json::Value =
+        serde_json::from_slice(&fetch(&h.app, "/admin/status").await.2).unwrap();
+    assert_eq!(json["cache"]["assets"][0]["encrypted"], true);
+    assert_eq!(
+        json["cache"]["assets"][0]["key_ids"],
+        serde_json::json!(["01234567-89ab-cdef-0123-456789abcdef"])
+    );
+    assert!(!json.to_string().contains(KEY));
+
+    let manifest = text(&fetch(&h.app, "/dash/grid/manifest.mpd").await.2);
+    assert_eq!(manifest.matches("<Period ").count(), 2, "{manifest}");
+    assert!(
+        manifest.matches("<ContentProtection").count() >= 2,
+        "every Period signals its protection: {manifest}"
+    );
+}
+
+#[tokio::test]
+async fn an_adaptive_clips_answer_with_hls_aes128_encrypts_every_segment_of_every_rendition() {
+    let h = harness().await;
+    h.mapper.state.set(
+        "grid",
+        two_clip_ladder("v1").with_hls_aes128(AES_KEY, AES_KEY_URI),
+    );
+    h.mapper.state.set("clear", two_clip_ladder("v1"));
+    let master = fetch(&h.app, "/hls/grid/master.m3u8").await;
+    assert_eq!(master.0, StatusCode::OK, "{}", text(&master.2));
+    let version = version_in(&master.2);
+    let key_line = format!("#EXT-X-KEY:METHOD=AES-128,URI=\"{AES_KEY_URI}\"");
+    for track in ["video-720p", "video-480p", "audio-1"] {
+        let playlist = text(
+            &fetch(&h.app, &format!("/hls/grid/{track}/index.m3u8"))
+                .await
+                .2,
+        );
+        assert!(playlist.contains(&key_line), "{track}: {playlist}");
+        assert_eq!(playlist.matches("#EXT-X-MAP").count(), 2, "{track}");
+    }
+    // Whole-segment encryption is HLS only, as for a plain sequence.
+    assert_eq!(
+        status(&h.app, "/dash/grid/manifest.mpd").await,
+        StatusCode::NOT_FOUND
+    );
+    // Each segment is one AES-128-CBC message: a whole number of blocks, unlike the clear one.
+    let clear_version = version_in(&fetch(&h.app, "/hls/clear/master.m3u8").await.2);
+    let encrypted = fetch(
+        &h.app,
+        &format!("/hls/grid/video-720p/segments/0/media.m4s?v={version}"),
+    )
+    .await;
+    let clear = fetch(
+        &h.app,
+        &format!("/hls/clear/video-720p/segments/0/media.m4s?v={clear_version}"),
+    )
+    .await;
+    assert_eq!(encrypted.0, StatusCode::OK);
+    assert_eq!(encrypted.2.len() % 16, 0);
+    assert_ne!(encrypted.2, clear.2);
+    // The init segments stay clear.
+    let init = fetch(
+        &h.app,
+        &format!("/hls/grid/video-720p/clips/0/init.mp4?v={version}"),
+    )
+    .await;
+    assert!(!init.2.windows(4).any(|w| w == b"encv"));
+}
+
+/// Each segment of an adaptive `AES-128` asset decrypts, under the IV of its global media
+/// sequence number, to exactly the bytes of its clear twin, in every rendition and clip.
+#[tokio::test]
+async fn adaptive_aes128_segments_decrypt_to_the_clear_twin() {
+    if !openssl_available() {
+        eprintln!("skipping: openssl is not installed");
+        return;
+    }
+    let h = harness().await;
+    h.mapper.state.set(
+        "aes",
+        two_clip_ladder("v1").with_hls_aes128(AES_KEY, AES_KEY_URI),
+    );
+    h.mapper.state.set("clear", two_clip_ladder("v1"));
+    let checked = assert_segments_decrypt_to_the_clear_twin(
+        &h,
+        "aes",
+        "clear",
+        &[
+            "video-720p/index.m3u8",
+            "video-480p/index.m3u8",
+            "audio-1/index.m3u8",
+        ],
+    )
+    .await;
+    assert!(checked >= 6, "{checked} segments checked");
+}
