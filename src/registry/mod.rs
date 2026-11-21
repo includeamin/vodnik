@@ -975,6 +975,7 @@ impl AssetRegistry {
             )));
         }
         let (files, indices) = distinct_locations(&resolved.renditions);
+        let encryption = resolved.encryption.clone();
         let plans = resolved
             .renditions
             .iter()
@@ -992,7 +993,11 @@ impl AssetRegistry {
                     clips: clips
                         .iter()
                         .zip(file_indices)
-                        .map(|(clip, &file)| (file, clip.window, None, clip.tracks))
+                        .map(|(clip, &file)| {
+                            // Whole-asset encryption (TDD 0016, stage 2): the answer's keys
+                            // cover every clip of every rendition.
+                            (file, clip.window, encryption.clone(), clip.tracks)
+                        })
                         .collect(),
                 })
             })
@@ -1001,6 +1006,7 @@ impl AssetRegistry {
 
         let asset_id = asset_id.to_owned();
         let version = resolved.version.clone();
+        let aes128 = resolved.hls_aes128.clone();
         let segment_duration_ms = self.settings.segment_duration_ms;
         let limits = self.limits.clone();
         let asset = tokio::task::spawn_blocking(move || {
@@ -1009,6 +1015,7 @@ impl AssetRegistry {
                 &clip_files,
                 &plans,
                 &version,
+                aes128.as_ref(),
                 segment_duration_ms,
                 &limits,
             )

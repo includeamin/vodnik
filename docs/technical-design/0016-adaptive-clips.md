@@ -1,8 +1,8 @@
 # TDD 0016: Adaptive clips
 
-- Status: Accepted; stage 1 implemented (clear content)
+- Status: Accepted; stages 1 (clear content) and 2 (whole-asset encryption) implemented
 - Created: 2026-10-16
-- Updated: 2026-10-16
+- Updated: 2026-11-22
 - Related ADRs: None
 - Related designs: [TDD 0002](0002-asset-map-interface.md) (the mapper interface), [TDD 0006](0006-trick-play-subtitles-and-renditions.md) (renditions), [TDD 0008](0008-clipping-and-concatenation.md) (clips, which deferred this), [TDD 0009](0009-common-encryption-and-drm.md), [TDD 0012](0012-hls-aes-128.md), [TDD 0013](0013-key-rotation.md), [TDD 0015](0015-vod-module-mapping-adapter.md) (the adapter this unblocks)
 
@@ -164,8 +164,9 @@ Rolling back a stage is removing its handling: an older build rejects a renditio
 
 ## Implementation status
 
-Stage 1 (clear content) is implemented; stages 2 and 3 (encryption) are not. What differs from the design above, or settles it:
+Stages 1 (clear content) and 2 (whole-asset encryption) are implemented; stage 3 (per-clip keys and key rotation) is not. What differs from the design above, or settles it:
 
+- **Stage 2.** The answer's `encryption` reaches every (rendition, clip) cut as it does a plain sequence's clips, and `hls_aes128` is applied to every cut and mixed into the version. Playlists, manifests and segment encryption needed no change beyond that, because they already read each clip's presentation: HLS writes `EXT-X-KEY` after each clip's `EXT-X-MAP`, DASH repeats `ContentProtection` in every Period, and an AES-128 asset is HLS only (its DASH manifest is `404`). Each AES-128 segment is encrypted under the IV of its global media sequence number; a test decrypts every segment of every rendition and clip to the bytes of its clear twin, and a mutation to the local number fails it. `/admin/status` lists the key IDs. Key periods (rotation) with rendition clips are still refused. Not checked here: `cbcs` playback of an adaptive sequence in a real player or DRM client.
 - **Shared timeline.** The test `every_rendition_starts_each_period_at_the_same_time_and_continues_the_last` shows that every rendition's period starts at the same time, that each rendition's first fragment starts where its period says it does, and that each period starts where the one before ended, within 40 ms. So the timeline taken from the first video rendition holds on the output side; it has not been checked on real devices.
 - **Audio follows the video's cut** (see Timeline). This was not in the design as first written.
 - **Length tolerance.** The clip-length check uses the largest longest sample of any video rendition in the clip, not the larger of each pair, which is simpler and at most one coarse sample looser.
