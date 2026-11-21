@@ -8,6 +8,7 @@
 mod catalog;
 mod mapper;
 mod policy;
+mod vod_module;
 
 use std::fmt;
 use std::path::PathBuf;
@@ -254,6 +255,14 @@ impl AssetResolver {
         match self {
             Self::Static(_) => "static",
             Self::Http(_) => "mapper",
+        }
+    }
+
+    /// What the mapper speaks, for status reporting. `None` for the static catalog.
+    pub(crate) fn dialect(&self) -> Option<&'static str> {
+        match self {
+            Self::Static(_) => None,
+            Self::Http(resolver) => Some(resolver.dialect()),
         }
     }
 

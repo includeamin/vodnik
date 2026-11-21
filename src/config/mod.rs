@@ -21,7 +21,8 @@ pub(crate) use cors::CorsConfig;
 pub(crate) use limits::LimitsConfig;
 pub(crate) use logging::{LogFormat, LoggingConfig};
 pub(crate) use resolver::{
-    MapperConfig, RegistryConfig, RemoteMediaConfig, ResolverSettings, Secret, read_token_file,
+    Dialect, MapperConfig, RegistryConfig, RemoteMediaConfig, ResolverSettings, Secret,
+    read_token_file,
 };
 pub(crate) use tls::TlsConfig;
 #[cfg(test)]
@@ -738,6 +739,65 @@ mod tests {
         }
         mapper_config("base_url = \"http://localhost:9\"\nallow_insecure_mapper = true")
             .expect("insecure mapper is allowed when opted in");
+    }
+
+    #[test]
+    fn the_vod_module_dialect_is_configured_and_checked() {
+        let config = mapper_config(
+            r#"
+            base_url = "https://mapping.internal.example.net"
+            dialect = "vod-module"
+            [resolver.http.vod_module]
+            path_template = "vod/{id}"
+            extra_args = "?key=abc"
+            host_header = "mapping.example"
+            file_root = "/data/media"
+            remote_base_url = "https://origin.example.net"
+            ignore = ["notifications"]
+            "#,
+        )
+        .expect("a complete dialect section is accepted");
+        let ResolverSettings::Http(mapper) = &config.resolver else {
+            panic!("expected the http resolver");
+        };
+        assert_eq!(mapper.dialect, Dialect::VodModule);
+        assert_eq!(mapper.vod_module.path_template, "vod/{id}");
+        assert_eq!(mapper.vod_module.extra_args.as_deref(), Some("key=abc"));
+        assert_eq!(mapper.vod_module.ignore, ["notifications"]);
+
+        let default =
+            mapper_config("base_url = \"https://m.example.net\"\ndialect = \"vod-module\"")
+                .expect("every dialect setting is optional");
+        let ResolverSettings::Http(mapper) = &default.resolver else {
+            panic!("expected the http resolver");
+        };
+        assert_eq!(mapper.vod_module.path_template, "{id}");
+    }
+
+    #[test]
+    fn invalid_vod_module_settings_are_rejected() {
+        let base = "base_url = \"https://m.example.net\"\ndialect = \"vod-module\"\n[resolver.http.vod_module]\n";
+        for extra in [
+            "path_template = \"vod/none\"",
+            "path_template = \"{id}/{id}\"",
+            "path_template = \"{id}?x=1\"",
+            "path_template = \"../{id}\"",
+            "extra_args = \"a=1#frag\"",
+            "host_header = \"two words\"",
+            "file_root = \"relative/path\"",
+            "remote_base_url = \"ftp://origin\"",
+            "health_url = \"not a url\"",
+            "unknown = 1",
+        ] {
+            mapper_config(&format!("{base}{extra}")).expect_err(extra);
+        }
+        // The section means nothing without the dialect.
+        mapper_config(
+            "base_url = \"https://m.example.net\"\n[resolver.http.vod_module]\nfile_root = \"/data\"",
+        )
+        .expect_err("a vod_module section needs dialect = vod-module");
+        mapper_config("base_url = \"https://m.example.net\"\ndialect = \"other\"")
+            .expect_err("an unknown dialect");
     }
 
     #[test]

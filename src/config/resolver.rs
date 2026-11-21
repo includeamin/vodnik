@@ -68,9 +68,139 @@ pub(super) struct RawResolver {
     pub(super) http: Option<RawMapper>,
 }
 
+/// What the mapper service speaks.
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+pub(crate) enum Dialect {
+    /// vodnik's own mapper API (`docs/mapper-api.md`).
+    #[default]
+    #[serde(rename = "native")]
+    Native,
+    /// An nginx-vod-module mapping service (TDD 0015).
+    #[serde(rename = "vod-module")]
+    VodModule,
+}
+
+impl Dialect {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::VodModule => "vod-module",
+        }
+    }
+}
+
+/// `[resolver.http.vod_module]`, as written.
+#[derive(Debug, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct RawVodModule {
+    path_template: Option<String>,
+    extra_args: Option<String>,
+    host_header: Option<String>,
+    file_root: Option<String>,
+    remote_base_url: Option<String>,
+    health_url: Option<String>,
+    ignore: Vec<String>,
+}
+
+/// The settings of the nginx-vod-module dialect, checked.
+#[derive(Debug, Clone)]
+pub(crate) struct VodModuleConfig {
+    /// After `base_url`; `{id}` is the asset ID, percent-encoded.
+    pub(crate) path_template: String,
+    /// A static query string (nginx-vod-module's `vod_upstream_extra_args`).
+    pub(crate) extra_args: Option<String>,
+    pub(crate) host_header: Option<String>,
+    /// Prefix of a mapping's file path, removed to make it relative to `storage.media_root`.
+    pub(crate) file_root: Option<String>,
+    /// Where `sourceType: http` paths live.
+    pub(crate) remote_base_url: Option<String>,
+    /// Absent means the mapping service is assumed healthy.
+    pub(crate) health_url: Option<String>,
+    /// JSON paths or field names accepted and dropped instead of refused.
+    pub(crate) ignore: Vec<String>,
+}
+
+impl Default for VodModuleConfig {
+    fn default() -> Self {
+        Self {
+            path_template: "{id}".to_owned(),
+            extra_args: None,
+            host_header: None,
+            file_root: None,
+            remote_base_url: None,
+            health_url: None,
+            ignore: Vec::new(),
+        }
+    }
+}
+
+impl RawVodModule {
+    fn validate(self) -> Result<VodModuleConfig> {
+        let fail = |message: &str| Err(Error::Configuration(message.to_owned()));
+        let template = self.path_template.unwrap_or_else(|| "{id}".to_owned());
+        if template.matches("{id}").count() != 1
+            || template.contains(['?', '#'])
+            || template.split('/').any(|part| part == "..")
+        {
+            return fail(
+                "resolver.http.vod_module.path_template must contain {id} once, with no query, fragment or `..`",
+            );
+        }
+        let extra_args = self
+            .extra_args
+            .map(|args| args.trim_start_matches('?').to_owned())
+            .filter(|args| !args.is_empty());
+        if extra_args
+            .as_deref()
+            .is_some_and(|args| args.contains(['#', ' ']) || args.chars().any(char::is_control))
+        {
+            return fail("resolver.http.vod_module.extra_args must be a plain query string");
+        }
+        if self
+            .host_header
+            .as_deref()
+            .is_some_and(|host| host.is_empty() || !host.bytes().all(|b| b.is_ascii_graphic()))
+        {
+            return fail("resolver.http.vod_module.host_header must be a visible ASCII host name");
+        }
+        let is_url = |url: &str| url.starts_with("https://") || url.starts_with("http://");
+        if self
+            .remote_base_url
+            .as_deref()
+            .is_some_and(|url| !is_url(url) || url.contains(['?', '#']))
+        {
+            return fail(
+                "resolver.http.vod_module.remote_base_url must be an http(s) URL without a query",
+            );
+        }
+        let health_url = self.health_url.filter(|url| !url.is_empty());
+        if health_url.as_deref().is_some_and(|url| !is_url(url)) {
+            return fail("resolver.http.vod_module.health_url must be an http(s) URL");
+        }
+        if self
+            .file_root
+            .as_deref()
+            .is_some_and(|root| !root.starts_with('/') || root.contains('\0'))
+        {
+            return fail("resolver.http.vod_module.file_root must be an absolute path");
+        }
+        Ok(VodModuleConfig {
+            path_template: template,
+            extra_args,
+            host_header: self.host_header,
+            file_root: self.file_root,
+            remote_base_url: self.remote_base_url,
+            health_url,
+            ignore: self.ignore,
+        })
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct RawMapper {
+    dialect: Dialect,
+    vod_module: Option<RawVodModule>,
     base_url: String,
     bearer_token_env: Option<String>,
     /// A file holding the token, re-read every `bearer_token_reload_ms` so a rotated token takes
@@ -95,6 +225,8 @@ pub(super) struct RawMapper {
 impl Default for RawMapper {
     fn default() -> Self {
         Self {
+            dialect: Dialect::Native,
+            vod_module: None,
             base_url: String::new(),
             bearer_token_env: None,
             bearer_token_file: None,
@@ -119,6 +251,8 @@ impl Default for RawMapper {
 /// The validated mapper client settings.
 #[derive(Debug, Clone)]
 pub(crate) struct MapperConfig {
+    pub(crate) dialect: Dialect,
+    pub(crate) vod_module: Box<VodModuleConfig>,
     pub(crate) base_url: String,
     pub(crate) bearer_token: Option<Secret>,
     /// Where `bearer_token` came from, when it is a file that is re-read.
@@ -213,7 +347,13 @@ impl RawMapper {
                     );
                 }
             };
+        if self.dialect == Dialect::Native && self.vod_module.is_some() {
+            return fail("resolver.http.vod_module needs dialect = \"vod-module\"");
+        }
+        let vod_module = Box::new(self.vod_module.unwrap_or_default().validate()?);
         Ok(MapperConfig {
+            dialect: self.dialect,
+            vod_module,
             base_url: url.to_owned(),
             bearer_token,
             bearer_token_file,

@@ -318,6 +318,7 @@ impl MockMapper {
         let state = Arc::new(MapperState::default());
         let app = Router::new()
             .route("/v1/assets/{id}", get(mapper_asset))
+            .route("/vod/{id}", get(mapper_asset))
             .route("/v1/health", get(mapper_health))
             .route("/v1/assets", get(mapper_listing))
             .with_state(Arc::clone(&state));

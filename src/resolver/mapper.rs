@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use reqwest::header::{ACCEPT, AUTHORIZATION, CACHE_CONTROL, IF_NONE_MATCH, RETRY_AFTER};
+use reqwest::header::{ACCEPT, AUTHORIZATION, CACHE_CONTROL, HOST, IF_NONE_MATCH, RETRY_AFTER};
 use reqwest::{Client, Response, StatusCode, Url};
 use serde::Deserialize;
 use time::OffsetDateTime;
@@ -15,13 +15,14 @@ use time::format_description::well_known::Rfc3339;
 use tokio::time::sleep;
 
 use super::policy::{LocationPolicy, validate_relative_path};
+use super::vod_module;
 use super::{
     AssetLocation, ClipLocation, RenditionLocation, RenditionSource, Resolution, ResolveError,
     ResolvedAsset, SubtitleLocation,
 };
 use crate::clip::{ClipWindow, MAX_CLIP_MS};
 use crate::config::Secret;
-use crate::config::{MapperConfig, is_valid_asset_id, read_token_file};
+use crate::config::{Dialect, MapperConfig, is_valid_asset_id, read_token_file};
 use crate::media::{AudioOverrides, TrackSelection};
 use crate::observability::request_id;
 
@@ -97,6 +98,10 @@ pub(crate) struct HttpResolver {
     max_clips: usize,
     /// `limits.max_sequence_files`: renditions times clips may not exceed it (TDD 0016).
     max_sequence_files: usize,
+    /// `packaging.segment_duration_ms`, which an nginx-vod-module mapping must agree with.
+    segment_duration_ms: u64,
+    /// `storage.media_root`, where a local file's identity is read from (TDD 0015).
+    media_root: PathBuf,
 }
 
 /// The JSON body of a `200` answer. Unknown fields are ignored so the contract can grow.
@@ -208,6 +213,8 @@ impl HttpResolver {
         policy: LocationPolicy,
         max_clips: usize,
         max_sequence_files: usize,
+        segment_duration_ms: u64,
+        media_root: PathBuf,
     ) -> crate::error::Result<Self> {
         let client = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -226,6 +233,8 @@ impl HttpResolver {
             policy,
             max_clips,
             max_sequence_files,
+            segment_duration_ms,
+            media_root,
         })
     }
 
@@ -259,6 +268,10 @@ impl HttpResolver {
         }
     }
 
+    pub(crate) fn dialect(&self) -> &'static str {
+        self.settings.dialect.name()
+    }
+
     /// The mapper's own base URL, for status reporting.
     pub(crate) fn base_url(&self) -> &str {
         &self.base_url
@@ -266,6 +279,17 @@ impl HttpResolver {
 
     /// `GET {base}/v1/health`; any `2xx` counts as healthy.
     pub(crate) async fn healthy(&self) -> bool {
+        if self.settings.dialect == Dialect::VodModule {
+            // A mapping service has no health endpoint of its own; the operator may name one.
+            return match &self.settings.vod_module.health_url {
+                Some(url) => self
+                    .authorized(self.client.get(url))
+                    .send()
+                    .await
+                    .is_ok_and(|response| response.status().is_success()),
+                None => true,
+            };
+        }
         self.authorized(self.client.get(format!("{}/v1/health", self.base_url)))
             .send()
             .await
@@ -281,6 +305,9 @@ impl HttpResolver {
         #[derive(Deserialize)]
         struct Listing {
             assets: Vec<String>,
+        }
+        if self.settings.dialect == Dialect::VodModule {
+            return None; // A mapping service cannot list its assets.
         }
         let response = self
             .authorized(self.client.get(format!("{}/v1/assets", self.base_url)))
@@ -320,14 +347,36 @@ impl HttpResolver {
         known_version: Option<&str>,
         request_id: &str,
     ) -> Result<Resolution, Failure> {
-        let mut request = self
-            .authorized(
-                self.client
-                    .get(format!("{}/v1/assets/{asset_id}", self.base_url)),
-            )
+        let mut request = match self.settings.dialect {
+            Dialect::Native => self
+                .client
+                .get(format!("{}/v1/assets/{asset_id}", self.base_url)),
+            Dialect::VodModule => {
+                let vod_module = &self.settings.vod_module;
+                let path = vod_module
+                    .path_template
+                    .replace("{id}", &percent_encode(asset_id));
+                let mut url = format!("{}/{}", self.base_url, path.trim_start_matches('/'));
+                if let Some(args) = &vod_module.extra_args {
+                    url.push('?');
+                    url.push_str(args);
+                }
+                let request = self.client.get(url);
+                match &vod_module.host_header {
+                    Some(host) => request.header(HOST, host),
+                    None => request,
+                }
+            }
+        };
+        request = self
+            .authorized(request)
             .header(ACCEPT, "application/json")
             .header("x-request-id", request_id);
-        if let Some(version) = known_version {
+        // A mapping service has no ETag, so it is always asked for the whole mapping and the
+        // translated version decides whether anything changed.
+        if self.settings.dialect == Dialect::Native
+            && let Some(version) = known_version
+        {
             request = request.header(IF_NONE_MATCH, format!("\"{version}\""));
         }
         let response = request.send().await.map_err(|error| {
@@ -339,6 +388,11 @@ impl HttpResolver {
             StatusCode::OK => {
                 let max_age = max_age(&response);
                 let body = self.read_body(response).await?;
+                if self.settings.dialect == Dialect::VodModule {
+                    return Ok(self
+                        .interpret_mapping(asset_id, known_version, &body, max_age)
+                        .await?);
+                }
                 let wire = parse_answer(&body)?;
                 Ok(Resolution::Resolved(
                     self.interpret(asset_id, wire, max_age)?,
@@ -374,6 +428,52 @@ impl HttpResolver {
                 Err(ResolveError::Rejected(format!("unexpected mapper status {status}")).into())
             }
         }
+    }
+
+    /// Translates an nginx-vod-module mapping into a native answer and interprets that, so the
+    /// translation adds one step and no second set of rules (TDD 0015).
+    async fn interpret_mapping(
+        &self,
+        asset_id: &str,
+        known_version: Option<&str>,
+        body: &[u8],
+        max_age_seconds: Option<u64>,
+    ) -> Result<Resolution, ResolveError> {
+        let vod_module = &self.settings.vod_module;
+        let translated = vod_module::translate(
+            body,
+            &vod_module::Settings {
+                asset_id: asset_id.to_owned(),
+                file_root: vod_module.file_root.clone(),
+                remote_base_url: vod_module.remote_base_url.clone(),
+                ignore: vod_module.ignore.clone(),
+                segment_duration_ms: self.segment_duration_ms,
+                max_clips: self.max_clips,
+            },
+        )
+        .map_err(|reason| {
+            tracing::warn!(event = "mapping_rejected", asset.id = asset_id, %reason);
+            ResolveError::Rejected(reason)
+        })?;
+        let mut answer = translated.answer;
+        vod_module::mix_in_file_identity(&mut answer, &self.media_root).await;
+        // `"cache": false` asks for the shortest reuse window the configuration allows.
+        let explicit_ttl = (!translated.cache).then_some(0);
+        let version = answer["version"].as_str().unwrap_or_default().to_owned();
+        if known_version == Some(version.as_str()) {
+            return Ok(Resolution::Unchanged {
+                valid_until: Instant::now() + self.ttl(explicit_ttl, max_age_seconds),
+            });
+        }
+        let wire = parse_answer(answer.to_string().as_bytes())?;
+        Ok(Resolution::Resolved(self.interpret(
+            asset_id,
+            Wire {
+                ttl_seconds: explicit_ttl,
+                ..wire
+            },
+            max_age_seconds,
+        )?))
     }
 
     /// Reads the body, failing as soon as it exceeds `max_response_bytes`.
@@ -875,6 +975,19 @@ fn max_age(response: &Response) -> Option<u64> {
         .find_map(|directive| directive.trim().strip_prefix("max-age=")?.parse().ok())
 }
 
+/// An asset ID as one URL path segment: everything but unreserved characters is escaped.
+fn percent_encode(text: &str) -> String {
+    use std::fmt::Write;
+    text.bytes().fold(String::new(), |mut out, byte| {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            let _ = write!(out, "%{byte:02X}");
+        }
+        out
+    })
+}
+
 /// A language tag as it can appear in a URL path: letters, digits, and single hyphens, starting
 /// with a letter, at most 35 characters.
 fn is_language_tag(tag: &str) -> bool {
@@ -888,7 +1001,7 @@ fn is_language_tag(tag: &str) -> bool {
 /// A rendition id as it appears in a URL path segment (`video-{id}`): letters, digits, and
 /// hyphens, starting with a letter or digit, bounded in length. Unlike a language tag, a hyphen
 /// may repeat or trail, since ids are opaque labels an operator picks, not structured tags.
-fn is_rendition_id(id: &str) -> bool {
+pub(super) fn is_rendition_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= MAX_RENDITION_ID_BYTES
         && id
@@ -936,6 +1049,8 @@ mod tests {
 
     fn resolver(max_clips: usize, max_sequence_files: usize) -> HttpResolver {
         let settings = MapperConfig {
+            dialect: Dialect::Native,
+            vod_module: Box::default(),
             base_url: "https://mapper.invalid".to_owned(),
             bearer_token: None,
             bearer_token_file: None,
@@ -958,6 +1073,8 @@ mod tests {
             LocationPolicy::new(&RemoteMediaConfig::default()),
             max_clips,
             max_sequence_files,
+            6000,
+            PathBuf::from("."),
         )
         .expect("the test settings are valid")
     }
