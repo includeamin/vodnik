@@ -156,6 +156,14 @@ pub(crate) fn translate(body: &[u8], settings: &Settings) -> Result<Translated, 
     let mut answer = serde_json::Map::new();
     answer.insert("asset_id".to_owned(), settings.asset_id.clone().into());
     media_answer(&media, &window, &mut answer)?;
+    let has_clips = answer.contains_key("clips")
+        || answer
+            .get("renditions")
+            .and_then(Value::as_array)
+            .is_some_and(|renditions| renditions.iter().any(|entry| entry.get("clips").is_some()));
+    if !subtitles.is_empty() && has_clips {
+        return Err("captions cannot be combined with clips".to_owned());
+    }
     if !subtitles.is_empty() {
         answer.insert("subtitles".to_owned(), subtitles.into());
     }
@@ -204,15 +212,31 @@ fn media_answer(
             }
         }
         many => {
+            // Every sequence is cut the same way, so they must have the same number of clips.
+            let (_, first_path, first) = &many[0];
+            if let Some((_, path, pieces)) = many.iter().find(|(_, _, p)| p.len() != first.len()) {
+                return Err(format!(
+                    "{path}: has {} clips, but {first_path} has {}",
+                    pieces.len(),
+                    first.len()
+                ));
+            }
+            let cut = first.len() > 1
+                || window.clip_from.is_some()
+                || window.clip_to.is_some()
+                || window.durations.is_some()
+                || many.iter().any(|(_, _, pieces)| pieces[0].from_ms > 0);
             let ids = rendition_ids(many.iter().map(|(sequence, ..)| *sequence));
             let mut renditions = Vec::new();
             for ((sequence, path, pieces), id) in many.iter().zip(ids) {
-                let [piece] = pieces.as_slice() else {
-                    return Err(format!(
-                        "{path}: adaptive playlists of several clips are not supported yet"
-                    ));
+                let mut entry = if cut {
+                    let mut entry = serde_json::Map::new();
+                    entry.insert("id".to_owned(), id.into());
+                    entry.insert("clips".to_owned(), clips(pieces, window)?.into());
+                    entry
+                } else {
+                    rendition(id, &pieces[0])
                 };
-                let mut entry = rendition(id, piece);
                 entry.extend(overrides(sequence, path)?);
                 renditions.push(Value::Object(entry));
             }
@@ -971,14 +995,69 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_playlists_of_several_clips_are_not_translated_yet() {
+    fn sequences_of_several_clips_become_renditions_that_are_sequences() {
+        let mapping = json!({"durations": [10000, 60000], "sequences": [
+            {"id": "v720", "clips": [
+                {"type": "source", "path": "/data/media/ad/720.mp4", "tracks": "v1"},
+                {"type": "source", "path": "/data/media/m/720.mp4", "tracks": "v1", "clipFrom": 5000}]},
+            {"language": "eng", "label": "English", "default": true, "clips": [
+                {"type": "source", "path": "/data/media/ad/en.mp4", "tracks": "a1"},
+                {"type": "source", "path": "/data/media/m/en.mp4", "tracks": "a1", "clipFrom": 5000}]},
+        ]});
+        assert_eq!(
+            answer(&mapping),
+            json!({
+                "asset_id": "movie",
+                "renditions": [
+                    {"id": "v720", "clips": [
+                        {"location": {"type": "file", "path": "ad/720.mp4"}, "from_ms": 0, "to_ms": 10000, "tracks": "v1"},
+                        {"location": {"type": "file", "path": "m/720.mp4"}, "from_ms": 5000, "to_ms": 65000, "tracks": "v1"}]},
+                    {"id": "s2", "language": "eng", "label": "English", "default": true, "clips": [
+                        {"location": {"type": "file", "path": "ad/en.mp4"}, "from_ms": 0, "to_ms": 10000, "tracks": "a1"},
+                        {"location": {"type": "file", "path": "m/en.mp4"}, "from_ms": 5000, "to_ms": 65000, "tracks": "a1"}]},
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn a_window_on_a_ladder_trims_every_rendition() {
+        let mapping = json!({"clipFrom": 1000, "clipTo": 9000, "sequences": [
+            {"id": "a", "clips": [source("/data/media/a.mp4")]},
+            {"id": "b", "clips": [source("/data/media/b.mp4")]}]});
+        let got = answer(&mapping);
+        for (rendition, file) in [(0, "a.mp4"), (1, "b.mp4")] {
+            assert_eq!(
+                got["renditions"][rendition]["clips"],
+                json!([{"location": {"type": "file", "path": file}, "from_ms": 1000, "to_ms": 9000, "tracks": "v1-a1"}])
+            );
+        }
+        let by_duration = json!({"durations": [4000], "sequences": [
+            {"id": "a", "clips": [source("/data/media/a.mp4")]},
+            {"id": "b", "clips": [source("/data/media/b.mp4")]}]});
+        assert_eq!(
+            answer(&by_duration)["renditions"][1]["clips"][0]["to_ms"],
+            4000
+        );
+    }
+
+    #[test]
+    fn sequences_with_different_numbers_of_clips_are_refused_naming_the_second() {
         let mapping = json!({"durations": [1000, 1000], "sequences": [
             {"clips": [source("/data/media/a.mp4"), source("/data/media/b.mp4")]},
-            {"clips": [source("/data/media/c.mp4"), source("/data/media/d.mp4")]}]});
+            {"clips": [source("/data/media/c.mp4")]}]});
         assert_eq!(
             refused(&mapping),
-            "sequences[0]: adaptive playlists of several clips are not supported yet"
+            "sequences[1]: has 1 clips, but sequences[0] has 2"
         );
+    }
+
+    #[test]
+    fn captions_beside_clips_are_refused() {
+        let mapping = json!({"durations": [1000, 1000], "sequences": [
+            {"clips": [source("/data/media/a.mp4"), source("/data/media/b.mp4")]},
+            {"language": "eng", "clips": [source("/data/media/en.vtt")]}]});
+        assert_eq!(refused(&mapping), "captions cannot be combined with clips");
     }
 
     #[test]
