@@ -6840,3 +6840,58 @@ async fn a_missing_mapping_is_a_missing_asset() {
         StatusCode::NOT_FOUND
     );
 }
+
+#[tokio::test]
+async fn a_vod_module_adaptive_playlist_is_served_like_the_native_adaptive_clips() {
+    let native_harness = harness().await;
+    native_harness.mapper.state.set(
+        "grid",
+        Answer::renditions_with_clips(
+            "v1",
+            &[
+                (
+                    "720p",
+                    &[
+                        clip("rendition-720p.mp4", None, Some(1000)),
+                        clip("rendition-720p.mp4", Some(1000), Some(2000)),
+                    ],
+                ),
+                (
+                    "480p",
+                    &[
+                        clip("rendition-480p.mp4", None, Some(1000)),
+                        clip("rendition-480p.mp4", Some(1000), Some(2000)),
+                    ],
+                ),
+            ],
+        ),
+    );
+    let native = playlist_without_version(&text(
+        &fetch(&native_harness.app, "/hls/grid/master.m3u8").await.2,
+    ));
+    let native_audio = playlist_without_version(&text(
+        &fetch(&native_harness.app, "/hls/grid/audio-1/index.m3u8")
+            .await
+            .2,
+    ));
+    let h = vod_module_harness().await;
+
+    let sequence = |id: &str, file: &str| {
+        serde_json::json!({"id": id, "clips": [
+            {"type": "source", "path": format!("/data/media/{file}"), "tracks": "v1-a1"},
+            {"type": "source", "path": format!("/data/media/{file}"), "tracks": "v1-a1", "clipFrom": 1000}]})
+    };
+    *h.mapper.state.raw_body.lock().unwrap() = Some(
+        serde_json::json!({"durations": [1000, 1000], "sequences": [
+            sequence("720p", "rendition-720p.mp4"),
+            sequence("480p", "rendition-480p.mp4")]})
+        .to_string(),
+    );
+    let (code, _, master) = fetch(&h.app, "/hls/grid/master.m3u8").await;
+    assert_eq!(code, StatusCode::OK, "{}", text(&master));
+    assert_eq!(playlist_without_version(&text(&master)), native);
+    let audio = fetch(&h.app, "/hls/grid/audio-1/index.m3u8").await.2;
+    assert_eq!(playlist_without_version(&text(&audio)), native_audio);
+    let manifest = text(&fetch(&h.app, "/dash/grid/manifest.mpd").await.2);
+    assert_eq!(manifest.matches("<Period ").count(), 2, "{manifest}");
+}
