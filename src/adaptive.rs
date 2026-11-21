@@ -26,8 +26,8 @@ pub(crate) struct RenditionPlan {
     pub(crate) id: String,
     /// The language, label and default of the audio it brings, in place of its file's.
     pub(crate) audio: Option<AudioOverrides>,
-    /// Its clips, as for a sequence: the file, the window, its own encryption (always `None` in
-    /// stage 1), and the tracks it serves.
+    /// Its clips, as for a sequence: the file, the window, its encryption (the answer's own, the
+    /// same for every clip until stage 3), and the tracks it serves.
     pub(crate) clips: Vec<ClipPlan>,
 }
 
@@ -62,6 +62,7 @@ pub(crate) fn build(
     files: &[ClipFile],
     renditions: &[RenditionPlan],
     mapper_version: &str,
+    aes128: Option<&Arc<crate::cenc::Aes128>>,
     segment_duration_ms: u64,
     limits: &LimitsConfig,
 ) -> Result<ServedAsset> {
@@ -80,11 +81,12 @@ pub(crate) fn build(
             "an adaptive asset needs at least one video rendition".to_owned(),
         ));
     }
-    let version = version_of(files, renditions, mapper_version);
+    let version = version_of(files, renditions, mapper_version, aes128);
     let cutter = Cutter {
         asset_id,
         files,
         version: &version,
+        aes128,
         segment_duration_ms,
         limits,
     };
@@ -149,6 +151,8 @@ struct Cutter<'a> {
     asset_id: &'a str,
     files: &'a [ClipFile],
     version: &'a str,
+    /// Whole-segment HLS AES-128 for every clip of every rendition (TDD 0012).
+    aes128: Option<&'a Arc<crate::cenc::Aes128>>,
     segment_duration_ms: u64,
     limits: &'a LimitsConfig,
 }
@@ -257,7 +261,7 @@ impl Cutter<'_> {
                 rendition.id
             ))
         };
-        let (file, _, _, tracks) = &rendition.clips[position];
+        let (file, _, encryption, tracks) = &rendition.clips[position];
         let (file, tracks) = (&self.files[*file], *tracks);
         let narrowed = sequence::narrow(&file.parsed.index, tracks).map_err(named)?;
         let cut = clip::trim(&narrowed, window, start, trailing).map_err(named)?;
@@ -280,10 +284,10 @@ impl Cutter<'_> {
             Extras {
                 subtitles: Vec::new(),
                 version: Some(self.version.to_owned()),
-                encryption: None,
+                encryption: encryption.clone(),
                 // An adaptive sequence serves its own playlists; clips are never muxed.
                 hls_mux_audio: false,
-                hls_aes128: None,
+                hls_aes128: self.aes128.cloned(),
                 source_keys: None,
                 // Applied above, before the clip was cut.
                 tracks: None,
@@ -361,7 +365,12 @@ fn video_kinds(files: &[ClipFile], renditions: &[RenditionPlan]) -> Result<Vec<b
 /// The URL version: the mapper's, and every (rendition, clip) pair's file, window and tracks, so
 /// trimming or replacing any one file gives new URLs. A rendition's id and the audio it names
 /// are part of it, so renaming or relabelling one changes it too.
-fn version_of(files: &[ClipFile], renditions: &[RenditionPlan], mapper_version: &str) -> String {
+fn version_of(
+    files: &[ClipFile],
+    renditions: &[RenditionPlan],
+    mapper_version: &str,
+    aes128: Option<&Arc<crate::cenc::Aes128>>,
+) -> String {
     use std::fmt::Write;
 
     let mut seed = mapper_version.to_owned();
@@ -378,7 +387,7 @@ fn version_of(files: &[ClipFile], renditions: &[RenditionPlan], mapper_version: 
     }
     clip::version_of(
         &seed,
-        None,
+        aes128.map(AsRef::as_ref),
         renditions.iter().flat_map(|rendition| {
             rendition
                 .clips
@@ -710,6 +719,32 @@ impl AdaptiveSequenceAsset {
         }
     }
 
+    /// Every key ID any clip of any rendition is encrypted with, deduped, or `None` when all is
+    /// served clear.
+    pub(crate) fn key_ids(&self) -> Option<Vec<String>> {
+        let mut ids: Vec<String> = Vec::new();
+        for (_, _, asset) in self.assets() {
+            for id in asset
+                .encryption()
+                .map(crate::cenc::Encryption::key_ids)
+                .unwrap_or_default()
+            {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+        (!ids.is_empty()).then_some(ids)
+    }
+
+    /// Whether every segment is encrypted whole (TDD 0012), a property of the answer, so any
+    /// asset speaks for all of them.
+    pub(crate) fn is_aes128(&self) -> bool {
+        self.assets()
+            .next()
+            .is_some_and(|(_, _, asset)| asset.is_aes128())
+    }
+
     fn assets(&self) -> impl Iterator<Item = (&str, usize, &Arc<PackagedAsset>)> {
         self.grids.iter().enumerate().flat_map(|(position, grid)| {
             let video = grid
@@ -838,6 +873,7 @@ mod tests {
             files,
             renditions,
             "v1",
+            None,
             1000,
             &LimitsConfig::default(),
         )

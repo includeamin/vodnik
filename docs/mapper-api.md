@@ -248,7 +248,8 @@ A rendition may give `clips` instead of `location`, so a pre-roll and a movie, o
 - To play one file in several clips or renditions, name it each time: a file is read once however many times it is named.
 - **Trimmed ladders.** A ladder whose renditions each have one clip is served as an ordinary adaptive asset with the usual URLs: this is how to trim an adaptive asset.
 - **Output.** The master playlist has one variant per video rendition, sorted by bandwidth. Each media playlist lists every clip with its own `#EXT-X-MAP` and an `#EXT-X-DISCONTINUITY` between clips, and the DASH manifest has one `Period` per clip. Init segments are `video-{id}/clips/{n}/init.mp4` and `audio-{n}/clips/{n}/init.mp4`, and the plain `{track}/init.mp4` does not exist. There are no I-frame playlists, as for any sequence.
-- **Not yet supported,** and refused with a message that points to [TDD 0016](technical-design/0016-adaptive-clips.md): `encryption`, `hls_aes128`, `source_encryption` and `subtitles` on such an answer, and a clip's own `encryption`.
+- **Encryption.** The answer's `encryption` (`cbcs`, one key set for every clip of every rendition) and `hls_aes128` (HLS only) both work. Key IDs, never keys, appear in `/admin/status`.
+- **Not yet supported,** and refused with a message that points to [TDD 0016](technical-design/0016-adaptive-clips.md): `encryption` with key periods (rotation) or a clear lead, `source_encryption` and `subtitles` on such an answer, and a clip's own `encryption`.
 
 ## Clips
 
