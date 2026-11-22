@@ -15,6 +15,7 @@ mod authorization;
 mod cenc;
 mod cli;
 mod clip;
+mod compat_id;
 mod composite;
 mod config;
 mod error;

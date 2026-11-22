@@ -217,6 +217,9 @@ pub(crate) struct VodModuleConfig {
     /// The key service of a deployment that encrypts with nginx-vod-module's DRM; `None` serves
     /// every asset clear.
     pub(crate) drm: Option<VodDrmConfig>,
+    /// Set by `[url_compat]`: an asset ID made from a file URI (`compat_id`) is turned back into
+    /// that URI, slashes and all, in the mapping request's path.
+    pub(crate) compat_ids: bool,
 }
 
 impl Default for VodModuleConfig {
@@ -230,6 +233,7 @@ impl Default for VodModuleConfig {
             health_url: None,
             ignore: Vec::new(),
             drm: None,
+            compat_ids: false,
         }
     }
 }
@@ -293,6 +297,7 @@ impl RawVodModule {
             health_url,
             ignore: self.ignore,
             drm: self.drm.map(RawVodDrm::validate).transpose()?,
+            compat_ids: false,
         })
     }
 }

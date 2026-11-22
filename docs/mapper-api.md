@@ -498,6 +498,10 @@ What is refused, with the JSON path in the error and never a value: live fields 
 
 The mapping has no version, so vodnik makes one from what decides the output: the locations (a URL without its query, so a re-signed URL does not reload the asset), windows, tracks, overrides and subtitles, plus the size and modification time of every local file. The service has no ETag, so every revalidation fetches the mapping again and nothing is reloaded when the version is unchanged. `"cache": false` in a mapping gives it the shortest reuse window, `min_ttl_ms`. A `404` is a missing asset. The service cannot list its assets, so the admin panel shows only what is loaded, and `/admin/status` reports the `dialect`.
 
+### URLs with a file URI
+
+An nginx-vod-module deployment's players use URLs such as `/hls/2020/05/movie.mp4/master.m3u8`, where a vodnik asset ID cannot hold a slash. Turn on `[url_compat]` (`enabled = true`, and `path_prefix = "/vod"` if a proxy puts something before `/hls` and `/dash`) and vodnik accepts such an entry URL and every URL a player follows from it, and asks the mapping service for `2020/05/movie.mp4` with its slashes, as nginx-vod-module does. It needs the `vod-module` dialect, covers `master.m3u8` and `manifest.mpd` entries, and limits the URI to 93 bytes. A URI with `..`, an empty segment or a control character is a `404`. The design is [TDD 0019](technical-design/0019-url-compatibility.md).
+
 ### The DRM bridge
 
 A deployment that encrypts with nginx-vod-module asks a key service for each asset's DRM info rather than putting keys in the mapping. Add `[resolver.http.vod_module.drm]` and vodnik asks it too, on every revalidation, at `{base_url}/{path_template}?{extra_args}` with the mapper's bearer token (`path_template`, `extra_args` and `host_header` as for the mapping; `clear_lead_segments` leaves that many leading segments clear; `max_response_bytes` caps the answer). The design is [TDD 0018](technical-design/0018-drm-bridge.md).

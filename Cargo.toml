@@ -36,6 +36,7 @@ tokio-rustls = "0.26"
 # `std` is needed to load a certificate and key from disk.
 rustls-pki-types = { version = "1", features = ["std"] }
 tokio-stream = "0.1"
+tower = { version = "0.5", features = ["util"] }
 toml = "1.1"
 tower-http = { version = "0.7", features = ["cors", "timeout", "trace"] }
 tracing = "0.1"
@@ -52,7 +53,6 @@ quick-xml = "0.42.0"
 mp4 = "0.14"
 tokio = { version = "1", features = ["io-util"] }
 proptest = "1"
-tower = { version = "0.5", features = ["util"] }
 
 [[bench]]
 name = "budgets"

@@ -327,6 +327,8 @@ pub(crate) struct MapperState {
     pub(crate) drm_calls: AtomicUsize,
     /// The `Authorization` header of every DRM info request, in order.
     pub(crate) drm_tokens: Mutex<Vec<Option<String>>>,
+    /// The raw path of every request to the `vod-module` mapping route, in order.
+    pub(crate) mapping_paths: Mutex<Vec<String>>,
 }
 
 impl MapperState {
@@ -356,7 +358,7 @@ impl MockMapper {
         let state = Arc::new(MapperState::default());
         let app = Router::new()
             .route("/v1/assets/{id}", get(mapper_asset))
-            .route("/vod/{id}", get(mapper_asset))
+            .route("/vod/{*id}", get(mapper_mapping))
             .route("/drm/{id}", get(mapper_drm))
             .route("/v1/health", get(mapper_health))
             .route("/v1/assets", get(mapper_listing))
@@ -378,6 +380,22 @@ async fn mapper_health(State(state): State<Arc<MapperState>>) -> StatusCode {
     } else {
         StatusCode::OK
     }
+}
+
+/// The mapping route of the `vod-module` dialect. A file URI holds slashes, so the route takes the
+/// whole rest of the path, and the raw path is kept to show that they arrive unescaped.
+async fn mapper_mapping(
+    State(state): State<Arc<MapperState>>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    state
+        .mapping_paths
+        .lock()
+        .unwrap()
+        .push(uri.path().to_owned());
+    mapper_asset(State(state), Path(id), headers).await
 }
 
 async fn mapper_drm(State(state): State<Arc<MapperState>>, headers: HeaderMap) -> Response {

@@ -131,7 +131,7 @@ Where it stands (2026-10-03, 60-minute asset):
 | Step | Status | Notes |
 | --- | --- | --- |
 | Mapping-JSON compatibility layer | Part 1 of 5 done for clear content: `tracks`, rendition language, label and default, the translator and the `vod-module` dialect of the HTTP resolver, including adaptive playlists of several clips, and the DRM bridge for `cbcs` ([TDD 0018](technical-design/0018-drm-bridge.md)), which asks a deployment's key service | [TDD 0015](technical-design/0015-vod-module-mapping-adapter.md): a `vod-module` dialect of the HTTP resolver reads the existing mapping service and translates single files, adaptive sets of sequences, clips with durations, captions and track selection. Later parts: adaptive playlists ([TDD 0016](technical-design/0016-adaptive-clips.md), stage 1 implemented), `cenc` and the DRM bridge, URL compatibility, fallback and the migration guide. [TDD 0008](technical-design/0008-clipping-and-concatenation.md) deferred "vod-module mapping compatibility" |
-| URL compatibility, or a redirect layer | Decide first | nginx-vod-module URLs differ from vodnik's. Players that load URLs from the mapper need nothing; hard-coded URLs need a rewrite at the proxy |
+| URL compatibility, or a redirect layer | Done for entry URLs | [TDD 0019](technical-design/0019-url-compatibility.md): `[url_compat]` accepts `/hls/<file URI>/master.m3u8` and `/dash/<file URI>/manifest.mpd` with slashes and dots, and everything a player follows from them, and asks the mapping service for the URI as nginx-vod-module does. Not yet `.urlset`, comma lists, `index.m3u8` as an entry or nginx's own segment URLs; needs a sample of real entry URLs |
 | Migration guide | To do | Feature mapping, configuration translation, and a shadow-traffic comparison procedure |
 | Shadow comparison in production | To do | Run both behind the same CDN on a sample of traffic, and compare manifests, segment decodes, and error rates before cutover |
 
@@ -179,7 +179,7 @@ nginx-vod-module documents each of these, and vodnik has no counterpart today.
 | Edit lists beyond one edit | Handled, with `vod_ignore_edit_list` to skip them | One edit, optionally after one empty edit; more is refused | Decide: an ignore option, or real multi-edit support |
 | Per-stream timing offset | Mapping `shift` | None | Decide first |
 | DASH `SegmentList` | Offered next to `SegmentTemplate` and `SegmentTimeline` | `SegmentTemplate` with `SegmentTimeline` only | Decide first: only for players that cannot use templates |
-| Several qualities from one URL | `.urlset` multi-URL sets | None; adaptive sets come only from the mapper | Part of the URL compatibility item in Phase 5 |
+| Several qualities from one URL | `.urlset` multi-URL sets | None; adaptive sets come only from the mapper | Not part of [TDD 0019](technical-design/0019-url-compatibility.md); add it if a deployment's URLs use it |
 | Notification callbacks | `notifications` and `vod_notification_uri` | None; the adapter refuses `notifications` | Fold into the ad markers design in Phase 3 |
 
 ## order

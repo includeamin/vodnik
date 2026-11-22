@@ -4,6 +4,7 @@ use axum::body::Body;
 use axum::http::StatusCode;
 use axum::middleware;
 use axum::routing::get;
+use tower::ServiceExt as _;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::{DefaultOnFailure, DefaultOnRequest, DefaultOnResponse, TraceLayer};
 use tracing::Level;
@@ -107,7 +108,7 @@ pub(crate) fn router(state: AppState) -> Router {
         Some(cors) => router.layer(cors),
         None => router,
     };
-    router
+    let router: Router = router
         .layer(middleware::from_fn_with_state(
             state.clone(),
             record_metrics,
@@ -132,7 +133,20 @@ pub(crate) fn router(state: AppState) -> Router {
                 .on_failure(DefaultOnFailure::new().level(Level::ERROR)),
         )
         .layer(middleware::from_fn(request_id))
-        .with_state(state)
+        .with_state(state.clone());
+    // Entry URLs in nginx-vod-module's shape are rewritten to native routes before routing, so
+    // they need nothing in the route table, and without `[url_compat]` there is nothing here.
+    match state.url_compat {
+        Some(compat) => Router::new().fallback_service(router.map_request(
+            move |mut request: axum::http::Request<Body>| {
+                if let Some(uri) = compat.rewrite(request.uri()) {
+                    *request.uri_mut() = uri;
+                }
+                request
+            },
+        )),
+        None => router,
+    }
 }
 
 #[cfg(test)]
