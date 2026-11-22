@@ -33,7 +33,7 @@ DRM is the most common reason a studio-licensed catalog cannot move. These steps
 | Different keys per clip | Done | Clear pre-roll before encrypted content; `METHOD=NONE` transitions |
 | HEVC encryption | Done | Slice-segment-header parser for HEVC (the `hvcC` path), checked against `FFmpeg`'s own parser on x265 and hand-built streams; same `cbcs` pattern as H.264. See [TDD 0009](technical-design/0009-common-encryption-and-drm.md#implementation-status) |
 | Whole-segment HLS AES-128 | Done | [TDD 0012](technical-design/0012-hls-aes-128.md). The mapper's `hls_aes128` gives a key and the URI players fetch it from; each segment is one AES-128-CBC message, the init segment stays clear, HLS only. Single-file, adaptive, and sequence assets; no I-frame playlists |
-| Key rotation within an asset | Done for single-file and adaptive assets | [TDD 0013](technical-design/0013-key-rotation.md): key periods, `seig` sample groups with one init segment, `EXT-X-KEY` per period, `pssh` in fragments; `clear_lead_ms` gives a clear lead. Not yet for sequences or I-frame playlists; not tested on real devices |
+| Key rotation within an asset | Done for single-file and adaptive assets | [TDD 0013](technical-design/0013-key-rotation.md): key periods, `seig` sample groups with one init segment, `EXT-X-KEY` per period, `pssh` in fragments; `clear_lead_ms` gives a clear lead. Per-clip periods work for the clips of an adaptive sequence ([TDD 0016](technical-design/0016-adaptive-clips.md)); not yet for the clips of a plain sequence or for I-frame playlists; not tested on real devices |
 | Decrypting CENC-encrypted source files | Stages 1 and 2 done | [TDD 0014](technical-design/0014-encrypted-source-files.md): a single file, progressive or fragmented, `cenc`, `cens`, `cbc1` and `cbcs`, decrypted with keys from the mapper's `source_encryption`, then clear or encrypted again. Still to do: adaptive assets and sequences, and passing a source's protection through. A wrong key can be caught only when the file's NAL lengths are encrypted |
 | AV1 and VP9 encryption | To do | OBU-aware and superframe-aware subsample rules |
 | Opus and FLAC encryption | To do | Whole-sample protection, as for AAC |
@@ -155,7 +155,7 @@ The order below refines [order](#order) with what the review found. Each project
 
 | # | Project | Status | Design |
 | --- | --- | --- | --- |
-| 1 | Adaptive playlists in the mapping adapter | Stages 1 (clear content) and 2 (whole-asset `cbcs` and `hls_aes128`) implemented; stage 3 (per-clip keys and key rotation) to do | [TDD 0016](technical-design/0016-adaptive-clips.md) |
+| 1 | Adaptive playlists in the mapping adapter | Stages 1 (clear content), 2 (whole-asset `cbcs` and `hls_aes128`) and 3 (per-clip keys and key rotation) implemented; the DRM bridge and the later migration parts remain | [TDD 0016](technical-design/0016-adaptive-clips.md) |
 | 2 | Verification harness: mapper-driven conformance, browser suite, Apple Media Stream Validator, DASH-IF conformance | Stages 1 (mapper-driven conformance) and 2 (browser suite) implemented; stage 3 (release check, DASH-IF spike) to do. It gives the evidence every later feature is checked against | [TDD 0017](technical-design/0017-verification-harness.md) |
 | 3 | The small gaps in the table below | To do, decided item by item | Each needs a decision first |
 | 4 | DRM completion | To do | Phase 1 |

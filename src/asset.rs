@@ -389,16 +389,23 @@ impl PackagedAsset {
     }
 
     /// Marks an encrypted track's segment as still to be encrypted once its bytes are read.
+    ///
+    /// `segment_index` is the segment's place in this asset, which is what a key period is
+    /// counted in; `sequence_number` is its number in what is served, which differs for a clip
+    /// that is not the first of a sequence and is what the fragment and a whole-segment `AES-128`
+    /// IV are numbered by.
     fn with_encryption(
         &self,
         track: &Track,
         segment: TrackSegment,
+        segment_index: u32,
         sequence_number: u32,
         mut prepared: fmp4::PreparedSegment,
     ) -> fmp4::PreparedSegment {
-        let protection = self.protection.as_ref().and_then(|protection| {
-            protection.for_segment(sequence_number.saturating_sub(1), track.id)
-        });
+        let protection = self
+            .protection
+            .as_ref()
+            .and_then(|protection| protection.for_segment(segment_index, track.id));
         if let Some(protection) = protection {
             let samples = track
                 .samples
@@ -547,7 +554,7 @@ impl PackagedAsset {
             .checked_add(1)
             .ok_or_else(|| Error::InvalidMedia("sequence number overflow".to_owned()))?;
         let prepared = fmp4::prepare_media_segment(track, segment, sequence_number, &self.limits)?;
-        Ok(self.with_encryption(track, segment, sequence_number, prepared))
+        Ok(self.with_encryption(track, segment, frame_index, sequence_number, prepared))
     }
 
     /// The HLS playlist that lists one subtitle file.
@@ -619,7 +626,13 @@ impl PackagedAsset {
 
         let prepared =
             fmp4::prepare_media_segment(track, track_segment, sequence_number, &self.limits)?;
-        Ok(self.with_encryption(track, track_segment, sequence_number, prepared))
+        Ok(self.with_encryption(
+            track,
+            track_segment,
+            segment_index,
+            sequence_number,
+            prepared,
+        ))
     }
 
     /// Logs what packaging left out or adjusted, so an operator can see why a file behaves as it
