@@ -16,6 +16,8 @@ use time::format_description::well_known::Rfc3339;
 use tokio::time::sleep;
 
 use super::policy::{LocationPolicy, validate_relative_path};
+use crate::compat_id;
+
 use super::vod_drm;
 use super::vod_module;
 use super::{
@@ -346,12 +348,33 @@ impl HttpResolver {
         }
     }
 
+    /// The asset ID as it goes into a mapping or key service request path. An ID made from a file
+    /// URI (`compat_id`) goes in as that URI, each segment escaped and the slashes kept, which is
+    /// what the service of an nginx-vod-module deployment expects; any other ID is escaped whole.
+    fn id_in_path(&self, asset_id: &str) -> String {
+        match compat_id::decode(asset_id) {
+            Some(uri) if self.settings.vod_module.compat_ids => uri
+                .split('/')
+                .map(percent_encode)
+                .collect::<Vec<_>>()
+                .join("/"),
+            _ => percent_encode(asset_id),
+        }
+    }
+
     async fn attempt(
         &self,
         asset_id: &str,
         known_version: Option<&str>,
         request_id: &str,
     ) -> Result<Resolution, Failure> {
+        // An ID of the reserved kind that does not decode was not made by this server.
+        if self.settings.vod_module.compat_ids
+            && asset_id.starts_with(compat_id::PREFIX)
+            && compat_id::decode(asset_id).is_none()
+        {
+            return Err(ResolveError::NotFound.into());
+        }
         let mut request = match self.settings.dialect {
             Dialect::Native => self
                 .client
@@ -360,7 +383,7 @@ impl HttpResolver {
                 let vod_module = &self.settings.vod_module;
                 let path = vod_module
                     .path_template
-                    .replace("{id}", &percent_encode(asset_id));
+                    .replace("{id}", &self.id_in_path(asset_id));
                 let mut url = format!("{}/{}", self.base_url, path.trim_start_matches('/'));
                 if let Some(args) = &vod_module.extra_args {
                     url.push('?');
@@ -505,7 +528,9 @@ impl HttpResolver {
         drm: &VodDrmConfig,
         request_id: &str,
     ) -> Result<Value, Failure> {
-        let path = drm.path_template.replace("{id}", &percent_encode(asset_id));
+        let path = drm
+            .path_template
+            .replace("{id}", &self.id_in_path(asset_id));
         let mut url = format!("{}/{}", self.base_url, path.trim_start_matches('/'));
         if let Some(args) = &drm.extra_args {
             url.push('?');

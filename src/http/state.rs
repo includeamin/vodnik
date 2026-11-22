@@ -28,6 +28,8 @@ pub(crate) struct AppState {
     /// Cleared by the background probe while the mapper is unreachable.
     pub(crate) resolver_healthy: Arc<AtomicBool>,
     pub(crate) cors: Option<CorsLayer>,
+    /// Entry URLs in nginx-vod-module's shape (TDD 0019); `None` adds nothing to the router.
+    pub(crate) url_compat: Option<super::compat::UrlCompat>,
     /// Signed playback tokens (TDD 0007); `None` adds no check to the router at all.
     pub(crate) authorization: Option<Arc<AuthorizationSettings>>,
     pub(crate) segment_queue_timeout: Duration,
@@ -108,6 +110,10 @@ impl AppState {
             ready: Arc::new(AtomicBool::new(true)),
             resolver_healthy: Arc::new(AtomicBool::new(true)),
             cors,
+            url_compat: config
+                .url_compat
+                .as_ref()
+                .map(|settings| super::compat::UrlCompat::new(&settings.path_prefix)),
             segment_queue_timeout: Duration::from_millis(config.limits.segment_queue_timeout_ms),
             stream_chunk_bytes: config.limits.stream_chunk_bytes,
             max_request_header_bytes: config.limits.max_request_header_bytes,

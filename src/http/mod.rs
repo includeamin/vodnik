@@ -2,6 +2,7 @@
 //!
 //! See `docs/internals/http-server.md` for how the pieces fit together.
 mod authorize;
+mod compat;
 mod cors;
 mod error;
 mod handlers;

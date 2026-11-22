@@ -7575,3 +7575,159 @@ async fn the_drm_service_is_asked_with_the_mappers_bearer_token() {
         [Some("Bearer mapper-token".to_owned())]
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// URL compatibility (TDD 0019)
+// ---------------------------------------------------------------------------------------------
+
+async fn compat_harness(prefix: &str) -> Harness {
+    let prefix = prefix.to_owned();
+    harness_with(move |config| {
+        config.hls_mux_audio = false;
+        let ResolverSettings::Http(mapper) = &mut config.resolver else {
+            panic!("the harness uses the http resolver");
+        };
+        mapper.dialect = crate::config::Dialect::VodModule;
+        mapper.vod_module.path_template = "vod/{id}".to_owned();
+        mapper.vod_module.file_root = Some("/data/media".to_owned());
+        mapper.vod_module.compat_ids = true;
+        config.url_compat = Some(crate::config::UrlCompatSettings {
+            path_prefix: prefix,
+        });
+    })
+    .await
+}
+
+fn mapping_paths(h: &Harness) -> Vec<String> {
+    h.mapper.state.mapping_paths.lock().unwrap().clone()
+}
+
+/// Every URL of a media playlist, resolved against the playlist's own URL as a player does.
+fn playlist_urls(playlist_url: &str, playlist: &str) -> Vec<String> {
+    let directory = playlist_url
+        .rsplit_once('/')
+        .map_or("", |(directory, _)| directory);
+    playlist
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.is_empty())
+        .map(|line| format!("{directory}/{line}"))
+        .collect()
+}
+
+#[tokio::test]
+async fn an_nginx_style_url_with_slashes_serves_the_asset_and_everything_it_links_to() {
+    let h = compat_harness("").await;
+    set_mapping(&h, &one_file(true));
+    let master_url = "/hls/2020/05/movie.mp4/master.m3u8";
+    let master = fetch(&h.app, master_url).await;
+    assert_eq!(master.0, StatusCode::OK, "{}", text(&master.2));
+    // The mapping service was asked for the file URI as nginx-vod-module would ask: with real
+    // slashes and the dot kept.
+    assert_eq!(mapping_paths(&h), ["/vod/2020/05/movie.mp4"]);
+
+    // Follow the links as a player does, relative to the URL each was fetched from.
+    let mut fetched = 0;
+    for line in text(&master.2).lines() {
+        let uri = line
+            .split("URI=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .or_else(|| (!line.starts_with('#') && !line.is_empty()).then_some(line));
+        let Some(uri) = uri else { continue };
+        let url = format!("/hls/2020/05/movie.mp4/{uri}");
+        let playlist = fetch(&h.app, &url).await;
+        assert_eq!(playlist.0, StatusCode::OK, "{url}");
+        for segment in playlist_urls(&url, &text(&playlist.2)).iter().take(2) {
+            assert_eq!(status(&h.app, segment).await, StatusCode::OK, "{segment}");
+            fetched += 1;
+        }
+    }
+    assert!(fetched >= 2, "the playlists link to segments");
+    // The same file, over DASH: the manifest, its init segment and a segment.
+    let manifest = fetch(&h.app, "/dash/2020/05/movie.mp4/manifest.mpd").await;
+    assert_eq!(manifest.0, StatusCode::OK);
+    let version = version_in(&fetch(&h.app, master_url).await.2);
+    for tail in ["video/init.mp4", "video/segments/0/media.m4s"] {
+        let url = format!("/dash/2020/05/movie.mp4/{tail}?v={version}");
+        assert_eq!(status(&h.app, &url).await, StatusCode::OK, "{url}");
+    }
+}
+
+#[tokio::test]
+async fn a_native_id_and_a_single_dotted_name_both_work() {
+    let h = compat_harness("").await;
+    set_mapping(&h, &one_file(true));
+    assert_eq!(
+        status(&h.app, "/hls/movie/master.m3u8").await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        status(&h.app, "/hls/movie.mp4/master.m3u8").await,
+        StatusCode::OK
+    );
+    assert_eq!(mapping_paths(&h), ["/vod/movie", "/vod/movie.mp4"]);
+}
+
+#[tokio::test]
+async fn escapes_in_the_url_are_escaped_again_for_the_mapping_service() {
+    let h = compat_harness("").await;
+    set_mapping(&h, &one_file(true));
+    assert_eq!(
+        status(&h.app, "/hls/a%20b/c%C3%BC.mp4/master.m3u8").await,
+        StatusCode::OK
+    );
+    assert_eq!(mapping_paths(&h), ["/vod/a%20b/c%C3%BC.mp4"]);
+}
+
+#[tokio::test]
+async fn a_prefix_in_front_of_hls_and_dash_is_stripped() {
+    let h = compat_harness("/vod").await;
+    set_mapping(&h, &one_file(true));
+    assert_eq!(
+        status(&h.app, "/vod/hls/x/y.mp4/master.m3u8").await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        status(&h.app, "/vod/dash/x/y.mp4/manifest.mpd").await,
+        StatusCode::OK
+    );
+    // Without the prefix the URL is not one of ours, and it is not guessed at.
+    assert_eq!(
+        status(&h.app, "/hls/x/y.mp4/master.m3u8").await,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn a_uri_that_cannot_be_passed_on_never_reaches_the_mapping_service() {
+    let h = compat_harness("").await;
+    set_mapping(&h, &one_file(true));
+    for url in [
+        "/hls/a/%2E%2E/b/master.m3u8",
+        "/hls/a//b/master.m3u8",
+        "/hls/a%2Fb/c/master.m3u8",
+        "/hls/a%00/b/master.m3u8",
+        &format!("/hls/{}/b/master.m3u8", "x".repeat(100)),
+        // An ID of this kind typed by hand is checked like a made one.
+        "/hls/vm--YS8uLi9i/master.m3u8",
+        "/hls/vm--_w/master.m3u8",
+    ] {
+        assert_eq!(status(&h.app, url).await, StatusCode::NOT_FOUND, "{url}");
+    }
+    assert_eq!(mapping_paths(&h), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn without_url_compatibility_such_a_url_is_not_found() {
+    let h = vod_module_harness().await;
+    set_mapping(&h, &one_file(true));
+    assert_eq!(
+        status(&h.app, "/hls/2020/05/movie.mp4/master.m3u8").await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        status(&h.app, "/hls/movie.mp4/master.m3u8").await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(mapping_paths(&h), Vec::<String>::new());
+}

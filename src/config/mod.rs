@@ -13,6 +13,7 @@ mod limits;
 mod logging;
 mod resolver;
 mod tls;
+mod url_compat;
 
 pub(crate) use authorization::AuthorizationSettings;
 #[cfg(test)]
@@ -27,6 +28,7 @@ pub(crate) use resolver::{
 pub(crate) use tls::TlsConfig;
 #[cfg(test)]
 pub(crate) use tls::for_test as tls_for_test;
+pub(crate) use url_compat::UrlCompatSettings;
 
 #[derive(Debug, Clone)]
 pub(crate) struct Config {
@@ -36,6 +38,8 @@ pub(crate) struct Config {
     /// `None` serves plain HTTP, as today. See `docs/operations.md#tls`.
     pub(crate) tls: Option<TlsConfig>,
     pub(crate) cors: CorsConfig,
+    /// Accept the entry URLs of an nginx-vod-module deployment (TDD 0019); `None` does not.
+    pub(crate) url_compat: Option<UrlCompatSettings>,
     pub(crate) segment_duration_ms: u64,
     /// Signed playback tokens (TDD 0007); `None` checks nothing.
     pub(crate) authorization: Option<AuthorizationSettings>,
@@ -81,6 +85,7 @@ impl Config {
             shutdown_grace_ms: 1000,
             tls: None,
             cors: CorsConfig::default(),
+            url_compat: None,
             segment_duration_ms,
             authorization: None,
             hls_mux_audio: default_hls_mux_audio(),
@@ -192,6 +197,8 @@ impl Config {
                 ResolverSettings::Http(mapper.validate(config_directory, environment)?)
             }
         };
+        let url_compat = raw.url_compat.validate()?;
+        let resolver = apply_url_compat(resolver, url_compat.as_ref())?;
 
         Ok(Self {
             listen: raw.server.listen,
@@ -199,6 +206,7 @@ impl Config {
             shutdown_grace_ms: raw.server.shutdown_grace_ms,
             tls,
             cors: raw.cors,
+            url_compat,
             segment_duration_ms: raw.packaging.segment_duration_ms,
             authorization,
             hls_mux_audio: raw.packaging.hls_mux_audio,
@@ -210,6 +218,24 @@ impl Config {
             logging: raw.logging,
             limits: raw.limits,
         })
+    }
+}
+
+/// Lets the mapper client turn the IDs of file URIs back into URIs, which only the `vod-module`
+/// dialect can pass on (TDD 0019). It is an error to enable the feature with anything else.
+fn apply_url_compat(
+    resolver: ResolverSettings,
+    url_compat: Option<&UrlCompatSettings>,
+) -> Result<ResolverSettings> {
+    match (resolver, url_compat) {
+        (ResolverSettings::Http(mut mapper), Some(_)) if mapper.dialect == Dialect::VodModule => {
+            mapper.vod_module.compat_ids = true;
+            Ok(ResolverSettings::Http(mapper))
+        }
+        (_, Some(_)) => Err(Error::Configuration(
+            "url_compat needs resolver.type = \"http\" with dialect = \"vod-module\"".to_owned(),
+        )),
+        (resolver, None) => Ok(resolver),
     }
 }
 
@@ -249,6 +275,8 @@ struct RawConfig {
     limits: LimitsConfig,
     #[serde(default)]
     cors: CorsConfig,
+    #[serde(default)]
+    url_compat: url_compat::RawUrlCompat,
     #[serde(default)]
     resolver: resolver::RawResolver,
     #[serde(default)]
@@ -772,6 +800,78 @@ mod tests {
             panic!("expected the http resolver");
         };
         assert_eq!(mapper.vod_module.path_template, "{id}");
+    }
+
+    fn compat_config(url_compat: &str, resolver: &str) -> Result<Config> {
+        Config::parse_with(
+            &format!(
+                r#"
+                    [server]
+                    listen = "127.0.0.1:8080"
+                    [storage]
+                    media_root = "."
+                    {url_compat}
+                    {resolver}
+                "#
+            ),
+            &fixture_directory(),
+            &|_| None,
+        )
+    }
+
+    const VOD_MODULE_RESOLVER: &str = "[resolver]\ntype = \"http\"\n[resolver.http]\nbase_url = \"https://m.example.net\"\ndialect = \"vod-module\"";
+
+    #[test]
+    fn url_compatibility_is_opt_in_and_needs_the_vod_module_dialect() {
+        let off = compat_config("", VOD_MODULE_RESOLVER).unwrap();
+        assert!(off.url_compat.is_none());
+        let disabled = compat_config("[url_compat]\nenabled = false", VOD_MODULE_RESOLVER).unwrap();
+        assert!(disabled.url_compat.is_none());
+
+        let on = compat_config(
+            "[url_compat]\nenabled = true\npath_prefix = \"/vod/\"",
+            VOD_MODULE_RESOLVER,
+        )
+        .unwrap();
+        assert_eq!(on.url_compat.as_ref().unwrap().path_prefix, "/vod");
+        let ResolverSettings::Http(mapper) = &on.resolver else {
+            panic!("expected the http resolver");
+        };
+        assert!(
+            mapper.vod_module.compat_ids,
+            "the mapper client turns the IDs back into URIs"
+        );
+
+        // Without the dialect there is nothing to pass a file URI on to.
+        for resolver in [
+            "",
+            "[resolver]\ntype = \"http\"\n[resolver.http]\nbase_url = \"https://m.example.net\"",
+        ] {
+            compat_config("[url_compat]\nenabled = true", resolver).expect_err(resolver);
+        }
+    }
+
+    #[test]
+    fn a_url_compatibility_prefix_must_be_a_plain_absolute_path() {
+        for prefix in [
+            "vod", "/a//b", "/a/../b", "/a?x", "/a#x", "/a b", "/%2e", "/a\\\\b", "//",
+        ] {
+            compat_config(
+                &format!("[url_compat]\nenabled = true\npath_prefix = \"{prefix}\""),
+                VOD_MODULE_RESOLVER,
+            )
+            .expect_err(prefix);
+        }
+        compat_config(
+            "[url_compat]\nenabled = true\npath_prefix = \"/a/b\"",
+            VOD_MODULE_RESOLVER,
+        )
+        .expect("a nested prefix is fine");
+        compat_config(
+            "[url_compat]\nenabled = true\nunknown = 1",
+            VOD_MODULE_RESOLVER,
+        )
+        .expect_err("unknown fields are refused");
     }
 
     #[test]

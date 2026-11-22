@@ -2001,6 +2001,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-stream",
  "toml",
+ "tower",
  "tower-http 0.7.1",
  "tracing",
  "tracing-appender",
