@@ -30,6 +30,8 @@ pub(crate) struct AppState {
     pub(crate) cors: Option<CorsLayer>,
     /// Entry URLs in nginx-vod-module's shape (TDD 0019); `None` adds nothing to the router.
     pub(crate) url_compat: Option<super::compat::UrlCompat>,
+    /// Pass a miss on to another server (TDD 0020); `None` adds no layer to the router.
+    pub(crate) fallback: Option<super::fallback::Fallback>,
     /// Signed playback tokens (TDD 0007); `None` adds no check to the router at all.
     pub(crate) authorization: Option<Arc<AuthorizationSettings>>,
     pub(crate) segment_queue_timeout: Duration,
@@ -114,6 +116,11 @@ impl AppState {
                 .url_compat
                 .as_ref()
                 .map(|settings| super::compat::UrlCompat::new(&settings.path_prefix)),
+            fallback: config
+                .fallback
+                .as_ref()
+                .map(super::fallback::Fallback::new)
+                .transpose()?,
             segment_queue_timeout: Duration::from_millis(config.limits.segment_queue_timeout_ms),
             stream_chunk_bytes: config.limits.stream_chunk_bytes,
             max_request_header_bytes: config.limits.max_request_header_bytes,

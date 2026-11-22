@@ -342,7 +342,9 @@ fn map_transport(error: reqwest::Error) -> Error {
 }
 
 fn status_error(status: StatusCode, action: &str) -> Error {
-    if status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS {
+    if status == StatusCode::NOT_FOUND {
+        Error::SourceMissing(format!("{status} while {action}"))
+    } else if status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS {
         Error::UpstreamUnavailable(format!("{status} while {action}"))
     } else {
         Error::Upstream(format!("{status} while {action}"))

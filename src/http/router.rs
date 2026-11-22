@@ -10,6 +10,7 @@ use tower_http::trace::{DefaultOnFailure, DefaultOnRequest, DefaultOnResponse, T
 use tracing::Level;
 
 use super::authorize::authorize;
+use super::fallback::fallback_on_miss;
 use super::handlers::{
     admin_status, clip_init_segment, dash_manifest, health, iframe_playlist, iframe_segment,
     init_segment, master_playlist, media_playlist, media_segment, metrics, ready, subtitle_file,
@@ -82,6 +83,15 @@ pub(crate) fn router(state: AppState) -> Router {
         .route(DASH_SEGMENT, get(media_segment));
     // Added only when `[authorization]` is configured: without it the router is unchanged, with no
     // branch and no cost.
+    // A miss is passed on only for a viewer who was let in, so the check sits outside this layer.
+    let media = if state.fallback.is_some() {
+        media.route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            fallback_on_miss,
+        ))
+    } else {
+        media
+    };
     let media = if state.authorization.is_some() {
         media.route_layer(middleware::from_fn_with_state(state.clone(), authorize))
     } else {
@@ -136,6 +146,8 @@ pub(crate) fn router(state: AppState) -> Router {
         .with_state(state.clone());
     // Entry URLs in nginx-vod-module's shape are rewritten to native routes before routing, so
     // they need nothing in the route table, and without `[url_compat]` there is nothing here.
+    // The outer router records the URL as the viewer sent it (`OriginalUri`) before the rewrite,
+    // which is the one `[fallback]` asks for.
     match state.url_compat {
         Some(compat) => Router::new().fallback_service(router.map_request(
             move |mut request: axum::http::Request<Body>| {

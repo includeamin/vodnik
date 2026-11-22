@@ -35,6 +35,11 @@ pub(crate) enum Error {
     #[error("upstream error: {0}")]
     Upstream(String),
 
+    /// The location resolved, but the media file is not there. Served as `502` like any other bad
+    /// location; the difference is that `[fallback]` may pass the request on.
+    #[error("media file does not exist: {0}")]
+    SourceMissing(String),
+
     #[error("location rejected by the media origin: {0}")]
     LocationRejected(String),
 

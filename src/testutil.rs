@@ -718,3 +718,75 @@ impl Drop for ScratchDir {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// A fallback server
+// ---------------------------------------------------------------------------------------------
+
+/// What `[fallback]` is expected to ask: it records every request and answers all of them the
+/// same way, whatever the path.
+pub(crate) struct FallbackState {
+    /// Each request's path with its query, and its headers.
+    pub(crate) requests: Mutex<Vec<(String, HeaderMap)>>,
+    pub(crate) status: AtomicU16,
+    pub(crate) body: Mutex<Vec<u8>>,
+    /// Sent as `Location` when set, so a test can have the fallback redirect.
+    pub(crate) location: Mutex<Option<String>>,
+}
+
+pub(crate) struct MockFallback {
+    pub(crate) address: SocketAddr,
+    pub(crate) state: Arc<FallbackState>,
+}
+
+impl MockFallback {
+    pub(crate) async fn start() -> Self {
+        let state = Arc::new(FallbackState {
+            requests: Mutex::new(Vec::new()),
+            status: AtomicU16::new(200),
+            body: Mutex::new(b"from the fallback".to_vec()),
+            location: Mutex::new(None),
+        });
+        let app = Router::new()
+            .fallback(fallback_answer)
+            .with_state(Arc::clone(&state));
+        Self {
+            address: serve(app).await,
+            state,
+        }
+    }
+
+    pub(crate) fn url(&self) -> String {
+        format!("http://{}", self.address)
+    }
+
+    pub(crate) fn requests(&self) -> Vec<(String, HeaderMap)> {
+        self.state.requests.lock().unwrap().clone()
+    }
+}
+
+async fn fallback_answer(
+    State(state): State<Arc<FallbackState>>,
+    request: axum::extract::Request,
+) -> Response {
+    let target = request
+        .uri()
+        .path_and_query()
+        .map_or_else(String::new, |value| value.as_str().to_owned());
+    state
+        .requests
+        .lock()
+        .unwrap()
+        .push((target, request.headers().clone()));
+    let status = StatusCode::from_u16(state.status.load(Ordering::SeqCst)).unwrap();
+    let mut response = (status, state.body.lock().unwrap().clone()).into_response();
+    response
+        .headers_mut()
+        .insert("x-from", HeaderValue::from_static("fallback"));
+    if let Some(location) = state.location.lock().unwrap().as_deref() {
+        response
+            .headers_mut()
+            .insert("location", HeaderValue::from_str(location).unwrap());
+    }
+    response
+}

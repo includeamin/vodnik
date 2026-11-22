@@ -108,6 +108,13 @@ path = "h264-aac.mp4"
 # enabled = true
 # path_prefix = ""                       # what a proxy puts before /hls and /dash, such as "/vod"
 #
+# [fallback]                             # pass a miss on to another server (nginx vod_fallback_upstream_location)
+# enabled = true
+# base_url = "https://dc2.example.net"
+# on_missing_file = true                 # also when the mapped media file is not there
+# timeout_ms = 5000
+# loop_header = "x-vod-fallback"         # a request carrying it is never forwarded again
+#
 # [resolver.http.vod_module.drm]         # ask the deployment's key service too (cbcs only)
 # path_template = "drm/{id}"
 # clear_lead_segments = 0                # the first N segments are left clear

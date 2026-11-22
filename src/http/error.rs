@@ -11,10 +11,20 @@ const NO_STORE: HeaderValue = HeaderValue::from_static("no-store");
 
 pub(crate) type HttpResult<T> = Result<T, HttpError>;
 
+/// What was missing, put on the response so `[fallback]` can tell a miss from any other error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Miss {
+    /// The resolver says there is no such asset.
+    Asset,
+    /// The asset resolved, but its media file is not there.
+    File,
+}
+
 #[derive(Debug)]
 pub(crate) struct HttpError {
     status: StatusCode,
     message: String,
+    miss: Option<Miss>,
 }
 
 impl HttpError {
@@ -22,6 +32,7 @@ impl HttpError {
         Self {
             status: StatusCode::NOT_FOUND,
             message: message.to_owned(),
+            miss: None,
         }
     }
 
@@ -29,6 +40,7 @@ impl HttpError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message,
+            miss: None,
         }
     }
 
@@ -36,6 +48,7 @@ impl HttpError {
         Self {
             status: StatusCode::BAD_GATEWAY,
             message,
+            miss: None,
         }
     }
 
@@ -43,14 +56,23 @@ impl HttpError {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
             message: message.to_owned(),
+            miss: None,
         }
+    }
+}
+
+impl HttpError {
+    fn missing(mut self, miss: Miss) -> Self {
+        self.miss = Some(miss);
+        self
     }
 }
 
 impl From<RegistryError> for HttpError {
     fn from(error: RegistryError) -> Self {
         match error {
-            RegistryError::NotFound => Self::not_found("asset does not exist"),
+            RegistryError::NotFound => Self::not_found("asset does not exist").missing(Miss::Asset),
+            RegistryError::SourceMissing(message) => Self::bad_gateway(message).missing(Miss::File),
             RegistryError::Unavailable(message) => Self::unavailable(&message),
             RegistryError::BadUpstream(message) => Self::bad_gateway(message),
             RegistryError::LoadFailed(message) => Self::internal(message),
@@ -62,6 +84,7 @@ impl From<Error> for HttpError {
     fn from(error: Error) -> Self {
         match error {
             Error::NotFound(message) => Self::not_found(message),
+            Error::SourceMissing(message) => Self::bad_gateway(message).missing(Miss::File),
             Error::Upstream(message) | Error::LocationRejected(message) => {
                 Self::bad_gateway(message)
             }
@@ -110,6 +133,9 @@ impl IntoResponse for HttpError {
             response
                 .headers_mut()
                 .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+        }
+        if let Some(miss) = self.miss {
+            response.extensions_mut().insert(miss);
         }
         response
     }

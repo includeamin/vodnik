@@ -5,6 +5,7 @@ mod authorize;
 mod compat;
 mod cors;
 mod error;
+mod fallback;
 mod handlers;
 mod middleware;
 mod range;
