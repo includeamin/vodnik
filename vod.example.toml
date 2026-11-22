@@ -103,6 +103,9 @@ path = "h264-aac.mp4"
 # file_root = "/data/media"               # removed from a source path; the rest is relative to media_root
 # remote_base_url = "https://origin.example.net"   # where `sourceType: http` paths live
 # ignore = []                             # fields to accept and drop instead of refusing
+# [resolver.http.vod_module.drm]         # ask the deployment's key service too (cbcs only)
+# path_template = "drm/{id}"
+# clear_lead_segments = 0                # the first N segments are left clear
 #
 # [registry]
 # max_cached_resolutions = 10000

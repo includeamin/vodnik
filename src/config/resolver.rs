@@ -89,6 +89,100 @@ impl Dialect {
     }
 }
 
+/// `[resolver.http.vod_module.drm]`, as written (TDD 0018).
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawVodDrm {
+    path_template: Option<String>,
+    extra_args: Option<String>,
+    host_header: Option<String>,
+    clear_lead_segments: u32,
+    max_response_bytes: usize,
+}
+
+impl Default for RawVodDrm {
+    fn default() -> Self {
+        Self {
+            path_template: None,
+            extra_args: None,
+            host_header: None,
+            clear_lead_segments: 0,
+            max_response_bytes: 16 * 1024,
+        }
+    }
+}
+
+/// Where an nginx-vod-module deployment's key service is, and how its DRM info is used.
+#[derive(Debug, Clone)]
+pub(crate) struct VodDrmConfig {
+    /// After `base_url`; `{id}` is the asset ID, percent-encoded.
+    pub(crate) path_template: String,
+    pub(crate) extra_args: Option<String>,
+    pub(crate) host_header: Option<String>,
+    /// How many of an asset's first segments are left clear
+    /// (nginx-vod-module's `vod_drm_clear_lead_segment_count`).
+    pub(crate) clear_lead_segments: u32,
+    pub(crate) max_response_bytes: usize,
+}
+
+impl Default for VodDrmConfig {
+    fn default() -> Self {
+        Self {
+            path_template: "{id}".to_owned(),
+            extra_args: None,
+            host_header: None,
+            clear_lead_segments: 0,
+            max_response_bytes: 16 * 1024,
+        }
+    }
+}
+
+impl RawVodDrm {
+    fn validate(self) -> Result<VodDrmConfig> {
+        let fail = |message: &str| Err(Error::Configuration(message.to_owned()));
+        let template = self.path_template.unwrap_or_else(|| "{id}".to_owned());
+        if template.matches("{id}").count() != 1
+            || template.contains(['?', '#'])
+            || template.split('/').any(|part| part == "..")
+        {
+            return fail(
+                "resolver.http.vod_module.drm.path_template must contain {id} once, with no query, fragment or `..`",
+            );
+        }
+        let extra_args = self
+            .extra_args
+            .map(|args| args.trim_start_matches('?').to_owned())
+            .filter(|args| !args.is_empty());
+        if extra_args
+            .as_deref()
+            .is_some_and(|args| args.contains(['#', ' ']) || args.chars().any(char::is_control))
+        {
+            return fail("resolver.http.vod_module.drm.extra_args must be a plain query string");
+        }
+        if self
+            .host_header
+            .as_deref()
+            .is_some_and(|host| host.is_empty() || !host.bytes().all(|b| b.is_ascii_graphic()))
+        {
+            return fail(
+                "resolver.http.vod_module.drm.host_header must be a visible ASCII host name",
+            );
+        }
+        if self.max_response_bytes == 0 {
+            return fail(
+                "resolver.http.vod_module.drm.max_response_bytes must be greater than zero",
+            );
+        }
+        Ok(VodDrmConfig {
+            path_template: template,
+            extra_args,
+            host_header: self.host_header,
+            clear_lead_segments: self.clear_lead_segments,
+            max_response_bytes: self.max_response_bytes,
+        })
+    }
+}
+
 /// `[resolver.http.vod_module]`, as written.
 #[derive(Debug, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
@@ -100,6 +194,8 @@ struct RawVodModule {
     remote_base_url: Option<String>,
     health_url: Option<String>,
     ignore: Vec<String>,
+    /// Present means the key service is asked for every asset (TDD 0018).
+    drm: Option<RawVodDrm>,
 }
 
 /// The settings of the nginx-vod-module dialect, checked.
@@ -118,6 +214,9 @@ pub(crate) struct VodModuleConfig {
     pub(crate) health_url: Option<String>,
     /// JSON paths or field names accepted and dropped instead of refused.
     pub(crate) ignore: Vec<String>,
+    /// The key service of a deployment that encrypts with nginx-vod-module's DRM; `None` serves
+    /// every asset clear.
+    pub(crate) drm: Option<VodDrmConfig>,
 }
 
 impl Default for VodModuleConfig {
@@ -130,6 +229,7 @@ impl Default for VodModuleConfig {
             remote_base_url: None,
             health_url: None,
             ignore: Vec::new(),
+            drm: None,
         }
     }
 }
@@ -192,6 +292,7 @@ impl RawVodModule {
             remote_base_url: self.remote_base_url,
             health_url,
             ignore: self.ignore,
+            drm: self.drm.map(RawVodDrm::validate).transpose()?,
         })
     }
 }

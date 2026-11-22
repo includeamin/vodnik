@@ -320,6 +320,13 @@ pub(crate) struct MapperState {
     /// The body `GET /v1/assets` answers with; `None` answers `404`, as a mapper that does not
     /// implement the optional listing would.
     pub(crate) listing: Mutex<Option<String>>,
+    /// The body the DRM info route answers with (TDD 0018); `None` answers `404`.
+    pub(crate) drm_body: Mutex<Option<String>>,
+    /// When non-zero, the DRM info route answers with this status.
+    pub(crate) drm_status: AtomicU16,
+    pub(crate) drm_calls: AtomicUsize,
+    /// The `Authorization` header of every DRM info request, in order.
+    pub(crate) drm_tokens: Mutex<Vec<Option<String>>>,
 }
 
 impl MapperState {
@@ -350,6 +357,7 @@ impl MockMapper {
         let app = Router::new()
             .route("/v1/assets/{id}", get(mapper_asset))
             .route("/vod/{id}", get(mapper_asset))
+            .route("/drm/{id}", get(mapper_drm))
             .route("/v1/health", get(mapper_health))
             .route("/v1/assets", get(mapper_listing))
             .with_state(Arc::clone(&state));
@@ -369,6 +377,24 @@ async fn mapper_health(State(state): State<Arc<MapperState>>) -> StatusCode {
         StatusCode::SERVICE_UNAVAILABLE
     } else {
         StatusCode::OK
+    }
+}
+
+async fn mapper_drm(State(state): State<Arc<MapperState>>, headers: HeaderMap) -> Response {
+    state.drm_calls.fetch_add(1, Ordering::SeqCst);
+    state.drm_tokens.lock().unwrap().push(
+        headers
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
+    );
+    let forced = state.drm_status.load(Ordering::SeqCst);
+    if forced != 0 {
+        return StatusCode::from_u16(forced).unwrap().into_response();
+    }
+    match state.drm_body.lock().unwrap().clone() {
+        Some(body) => ([(CONTENT_TYPE, "application/json")], body).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
