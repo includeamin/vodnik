@@ -44,6 +44,50 @@ impl Cipher {
     }
 }
 
+/// AES-128 in counter mode for the `cenc` scheme (ISO/IEC 23001-7, 10.1): the counter block is the
+/// sample's 8-byte IV followed by an 8-byte block counter that starts at zero. A sample's protected
+/// ranges are one continuous stream, so the keystream carries on across them, and across a range
+/// that ends part way through a block.
+pub(crate) struct CtrStream<'a> {
+    cipher: &'a Cipher,
+    counter: [u8; 16],
+    /// Bytes of the stream already used.
+    position: u64,
+    block: [u8; 16],
+}
+
+impl<'a> CtrStream<'a> {
+    pub(crate) fn new(cipher: &'a Cipher, iv: [u8; 8]) -> Self {
+        let mut counter = [0u8; 16];
+        counter[..8].copy_from_slice(&iv);
+        Self::from_counter_block(cipher, counter)
+    }
+
+    fn from_counter_block(cipher: &'a Cipher, counter: [u8; 16]) -> Self {
+        Self {
+            cipher,
+            counter,
+            position: 0,
+            block: [0; 16],
+        }
+    }
+
+    /// Encrypts (or decrypts: it is the same operation) the next bytes of the stream in place.
+    pub(crate) fn apply(&mut self, data: &mut [u8]) {
+        for byte in data {
+            let within = (self.position % 16) as usize;
+            if within == 0 {
+                self.block = self.counter;
+                self.cipher.0.encrypt_block((&mut self.block).into());
+                let low = u64::from_be_bytes(self.counter[8..].try_into().expect("eight bytes"));
+                self.counter[8..].copy_from_slice(&low.wrapping_add(1).to_be_bytes());
+            }
+            *byte ^= self.block[within];
+            self.position += 1;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,5 +163,67 @@ mod tests {
                 "block {block} stays clear"
             );
         }
+    }
+
+    // NIST SP 800-38A, F.5.1 (CTR-AES128.Encrypt).
+    const CTR_COUNTER: &str = "f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff";
+    const CTR_CIPHER: [&str; 4] = [
+        "874d6191b620e3261bef6864990db6ce",
+        "9806f66b7970fdff8617187bb9fffdff",
+        "5ae4df3edbd5d35e5b4f09020db03eab",
+        "1e031dda2fbe03d1792170a0f3009cee",
+    ];
+
+    fn ctr_plain() -> Vec<u8> {
+        PLAIN.iter().flat_map(|block| hex(block)).collect()
+    }
+
+    fn ctr_expected() -> Vec<u8> {
+        CTR_CIPHER.iter().flat_map(|block| hex(block)).collect()
+    }
+
+    #[test]
+    fn counter_mode_matches_the_nist_vector() {
+        let (cipher, _) = cipher();
+        let mut stream =
+            CtrStream::from_counter_block(&cipher, hex(CTR_COUNTER).try_into().unwrap());
+        let mut data = ctr_plain();
+        stream.apply(&mut data);
+        assert_eq!(data, ctr_expected());
+    }
+
+    #[test]
+    fn the_keystream_carries_across_ranges_and_part_blocks() {
+        let (cipher, _) = cipher();
+        let mut stream =
+            CtrStream::from_counter_block(&cipher, hex(CTR_COUNTER).try_into().unwrap());
+        // The same bytes handed over in uneven pieces, as a sample's protected ranges are.
+        let mut data = ctr_plain();
+        let mut out = Vec::new();
+        let mut rest = data.as_mut_slice();
+        for piece in [5usize, 20, 1, 38] {
+            let (head, tail) = rest.split_at_mut(piece);
+            stream.apply(head);
+            out.extend_from_slice(head);
+            rest = tail;
+        }
+        assert_eq!(out, ctr_expected());
+    }
+
+    #[test]
+    fn the_counter_is_the_iv_then_a_block_count_from_zero() {
+        let (cipher, _) = cipher();
+        let iv = [1, 2, 3, 4, 5, 6, 7, 8];
+        let mut zeros = vec![0u8; 32];
+        CtrStream::new(&cipher, iv).apply(&mut zeros);
+        let mut first = [1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut second = first;
+        second[15] = 1;
+        let block = |block: &mut [u8; 16]| {
+            cipher.0.encrypt_block((&mut *block).into());
+            *block
+        };
+        assert_eq!(&zeros[..16], block(&mut first));
+        assert_eq!(&zeros[16..], block(&mut second));
     }
 }

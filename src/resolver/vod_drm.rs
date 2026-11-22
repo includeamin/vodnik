@@ -15,7 +15,11 @@ use sha2::{Digest, Sha256};
 const MAX_SYSTEMS: usize = 8;
 const MAX_PSSH_BYTES: usize = 16 * 1024;
 
-pub(crate) fn encryption_from_drm_info(body: &[u8], clear_lead_ms: u64) -> Result<Value, String> {
+pub(crate) fn encryption_from_drm_info(
+    body: &[u8],
+    clear_lead_ms: u64,
+    dash_cenc: bool,
+) -> Result<Value, String> {
     let info: Value = serde_json::from_slice(body).map_err(|error| {
         format!(
             "DRM info is not valid JSON (line {}, column {})",
@@ -56,6 +60,9 @@ pub(crate) fn encryption_from_drm_info(body: &[u8], clear_lead_ms: u64) -> Resul
     });
     if clear_lead_ms > 0 {
         encryption["clear_lead_ms"] = clear_lead_ms.into();
+    }
+    if dash_cenc {
+        encryption["dash_scheme"] = "cenc".into();
     }
     Ok(encryption)
 }
@@ -202,7 +209,7 @@ mod tests {
     }
 
     fn run(info: &Value) -> Result<Value, String> {
-        encryption_from_drm_info(info.to_string().as_bytes(), 0)
+        encryption_from_drm_info(info.to_string().as_bytes(), 0, false)
     }
 
     #[test]
@@ -241,10 +248,20 @@ mod tests {
     #[test]
     fn a_clear_lead_is_passed_on() {
         let info = json!([entry(&[])]).to_string();
-        let got = encryption_from_drm_info(info.as_bytes(), 12_000).unwrap();
+        let got = encryption_from_drm_info(info.as_bytes(), 12_000, false).unwrap();
         assert_eq!(got["clear_lead_ms"], 12_000);
-        let none = encryption_from_drm_info(info.as_bytes(), 0).unwrap();
+        let none = encryption_from_drm_info(info.as_bytes(), 0, false).unwrap();
         assert!(none.get("clear_lead_ms").is_none());
+    }
+
+    #[test]
+    fn cenc_for_dash_is_passed_on_and_left_out_otherwise() {
+        let info = json!([entry(&[])]).to_string();
+        let on = encryption_from_drm_info(info.as_bytes(), 0, true).unwrap();
+        assert_eq!(on["dash_scheme"], "cenc");
+        assert_eq!(on["scheme"], "cbcs", "HLS stays cbcs");
+        let off = encryption_from_drm_info(info.as_bytes(), 0, false).unwrap();
+        assert!(off.get("dash_scheme").is_none());
     }
 
     #[test]
@@ -334,7 +351,7 @@ mod tests {
             assert_eq!(run(&info).unwrap_err(), expected, "{info}");
         }
         assert!(
-            encryption_from_drm_info(b"{", 0)
+            encryption_from_drm_info(b"{", 0, false)
                 .unwrap_err()
                 .starts_with("DRM info is not valid JSON")
         );

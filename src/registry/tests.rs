@@ -7389,6 +7389,10 @@ const DRM_KEY_ID: [u8; 16] = [
 ];
 
 async fn vod_drm_harness(clear_lead_segments: u32) -> Harness {
+    vod_drm_harness_with(clear_lead_segments, false).await
+}
+
+async fn vod_drm_harness_with(clear_lead_segments: u32, dash_cenc: bool) -> Harness {
     harness_with(|config| {
         config.hls_mux_audio = false;
         let ResolverSettings::Http(mapper) = &mut config.resolver else {
@@ -7400,6 +7404,7 @@ async fn vod_drm_harness(clear_lead_segments: u32) -> Harness {
         mapper.vod_module.drm = Some(crate::config::VodDrmConfig {
             path_template: "drm/{id}".to_owned(),
             clear_lead_segments,
+            dash_cenc,
             ..crate::config::VodDrmConfig::default()
         });
     })
@@ -7937,4 +7942,364 @@ async fn the_fallback_is_asked_for_the_url_the_viewer_used_under_url_compatibili
         fallback.requests()[0].0,
         "/vod/hls/2020/05/missing.mp4/master.m3u8?a=1"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// `cenc` for DASH (TDD 0021)
+// ---------------------------------------------------------------------------------------------
+
+fn cenc_for_dash_encryption(key: &str) -> serde_json::Value {
+    let mut encryption = clear_key_encryption(key);
+    encryption["dash_scheme"] = serde_json::json!("cenc");
+    encryption
+}
+
+fn find_box_payload(bytes: &[u8], name: [u8; 4]) -> Option<usize> {
+    bytes
+        .windows(4)
+        .position(|window| window == name)
+        .map(|at| at + 4)
+}
+
+#[tokio::test]
+async fn dash_is_signalled_and_initialised_as_cenc_while_hls_stays_cbcs() {
+    let h = harness().await;
+    h.mapper.state.set(
+        "one",
+        Answer::file("v1", "h264-aac.mp4").with_encryption(cenc_for_dash_encryption(KEY)),
+    );
+    let master = fetch(&h.app, "/hls/one/master.m3u8").await.2;
+    let version = version_in(&master);
+    assert!(
+        text(&master).contains("METHOD=SAMPLE-AES"),
+        "HLS is still SAMPLE-AES"
+    );
+
+    let mpd = text(&fetch(&h.app, "/dash/one/manifest.mpd").await.2);
+    assert!(mpd.contains(r#"value="cenc""#), "{mpd}");
+    assert!(!mpd.contains(r#"value="cbcs""#), "{mpd}");
+
+    for track in ["video", "audio-1"] {
+        let dash = fetch(&h.app, &format!("/dash/one/{track}/init.mp4?v={version}")).await;
+        assert_eq!(dash.0, StatusCode::OK);
+        let schm = find_box_payload(&dash.2, *b"schm").expect("a protection scheme box");
+        assert_eq!(&dash.2[schm + 4..schm + 8], b"cenc", "{track} over DASH");
+        let tenc = find_box_payload(&dash.2, *b"tenc").expect("a tenc box");
+        assert_eq!(
+            &dash.2[tenc + 6..tenc + 8],
+            &[1, 8],
+            "protected, eight-byte IV"
+        );
+
+        let hls = fetch(&h.app, &format!("/hls/one/{track}/init.mp4?v={version}")).await;
+        let schm = find_box_payload(&hls.2, *b"schm").expect("a protection scheme box");
+        assert_eq!(&hls.2[schm + 4..schm + 8], b"cbcs", "{track} over HLS");
+    }
+}
+
+#[tokio::test]
+async fn cenc_segments_carry_a_distinct_iv_per_sample_and_are_repeatable() {
+    let h = harness().await;
+    h.mapper.state.set(
+        "one",
+        Answer::file("v1", "h264-aac.mp4").with_encryption(cenc_for_dash_encryption(KEY)),
+    );
+    let version = version_in(&fetch(&h.app, "/hls/one/master.m3u8").await.2);
+    let uri = format!("/dash/one/video/segments/0/media.m4s?v={version}");
+    let first = fetch(&h.app, &uri).await;
+    assert_eq!(first.0, StatusCode::OK);
+    assert_eq!(
+        first.2,
+        fetch(&h.app, &uri).await.2,
+        "every replica makes the same bytes"
+    );
+
+    // `senc`: version and flags, a count, then each sample's IV and subsamples.
+    let senc = find_box_payload(&first.2, *b"senc").unwrap();
+    assert_eq!(
+        &first.2[senc..senc + 4],
+        &[0, 0, 0, 2],
+        "subsamples are present"
+    );
+    let samples = u32::from_be_bytes(first.2[senc + 4..senc + 8].try_into().unwrap()) as usize;
+    assert!(samples > 1);
+    let mut ivs = Vec::new();
+    let mut at = senc + 8;
+    for _ in 0..samples {
+        ivs.push(first.2[at..at + 8].to_vec());
+        let subsamples = u16::from_be_bytes(first.2[at + 8..at + 10].try_into().unwrap()) as usize;
+        at += 8 + 2 + 6 * subsamples;
+    }
+    let mut distinct = ivs.clone();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(distinct.len(), ivs.len(), "no two samples share an IV");
+
+    // Another segment's IVs differ too, and the same segment over HLS is plain cbcs.
+    let other = fetch(
+        &h.app,
+        &format!("/dash/one/video/segments/1/media.m4s?v={version}"),
+    )
+    .await;
+    let other_senc = find_box_payload(&other.2, *b"senc").unwrap();
+    assert!(!ivs.contains(&other.2[other_senc + 8..other_senc + 16].to_vec()));
+    let hls = fetch(
+        &h.app,
+        &format!("/hls/one/video/segments/0/media.m4s?v={version}"),
+    )
+    .await;
+    let hls_senc = find_box_payload(&hls.2, *b"senc").unwrap();
+    assert_eq!(
+        u32::from_be_bytes(hls.2[hls_senc + 4..hls_senc + 8].try_into().unwrap()) as usize,
+        samples
+    );
+    assert_ne!(
+        hls.2, first.2,
+        "the two protocols are encrypted differently"
+    );
+}
+
+#[tokio::test]
+async fn ffmpeg_decrypts_what_we_serve_as_cenc_over_dash_and_cbcs_over_hls() {
+    if std::process::Command::new("ffprobe")
+        .arg("-version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipping: ffprobe is not installed");
+        return;
+    }
+    let h = harness().await;
+    h.mapper.state.set(
+        "one",
+        Answer::file("v1", "h264-aac.mp4").with_encryption(cenc_for_dash_encryption(KEY)),
+    );
+    let version = version_in(&fetch(&h.app, "/hls/one/master.m3u8").await.2);
+    let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/cenc-decode");
+
+    for protocol in ["dash", "hls"] {
+        let segments = (0..3)
+            .map(|n| format!("segments/{n}/media.m4s?v={version}"))
+            .collect();
+        let clips = vec![(format!("init.mp4?v={version}"), segments)];
+        let frames = decode_each(
+            &h.app,
+            &format!("/{protocol}/one/video/"),
+            &clips,
+            &directory.join(protocol),
+            Some(KEY),
+        )
+        .await;
+        assert_eq!(
+            frames,
+            [90],
+            "{protocol}: every frame decodes with the right key"
+        );
+
+        let mut audio = fetch(
+            &h.app,
+            &format!("/{protocol}/one/audio-1/init.mp4?v={version}"),
+        )
+        .await
+        .2
+        .to_vec();
+        for n in 0..3 {
+            audio.extend_from_slice(
+                &fetch(
+                    &h.app,
+                    &format!("/{protocol}/one/audio-1/segments/{n}/media.m4s?v={version}"),
+                )
+                .await
+                .2,
+            );
+        }
+        let path = directory.join(format!("{protocol}-audio.mp4"));
+        std::fs::write(&path, audio).unwrap();
+        assert_eq!(
+            decode_errors(&path, Some(KEY)),
+            "",
+            "{protocol}: audio decrypts cleanly"
+        );
+        assert_ne!(
+            decode_errors(&path, Some("ffeeddccbbaa99887766554433221100")),
+            "",
+            "{protocol}: a wrong key does not"
+        );
+        let video = directory.join(protocol).join("clip-0.mp4");
+        assert_ne!(
+            decode_errors(&video, None),
+            "",
+            "{protocol}: without the key the video is not clear"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cenc_for_dash_works_for_clips_and_adaptive_sets_too() {
+    let h = harness().await;
+    h.mapper.state.set(
+        "seq",
+        Answer::clips(
+            "v1",
+            &[
+                clip("h264-aac.mp4", None, None),
+                clip("rendition-720p.mp4", None, None),
+            ],
+        )
+        .with_encryption(cenc_for_dash_encryption(KEY)),
+    );
+    let version = version_in(&fetch(&h.app, "/hls/seq/master.m3u8").await.2);
+    let mpd = text(&fetch(&h.app, "/dash/seq/manifest.mpd").await.2);
+    assert!(
+        mpd.contains(r#"value="cenc""#) && !mpd.contains(r#"value="cbcs""#),
+        "{mpd}"
+    );
+    for clip in 0..2 {
+        let init = fetch(
+            &h.app,
+            &format!("/dash/seq/video/clips/{clip}/init.mp4?v={version}"),
+        )
+        .await;
+        assert_eq!(init.0, StatusCode::OK);
+        let schm = find_box_payload(&init.2, *b"schm").unwrap();
+        assert_eq!(&init.2[schm + 4..schm + 8], b"cenc", "clip {clip}");
+    }
+    let hls_init = fetch(
+        &h.app,
+        &format!("/hls/seq/video/clips/0/init.mp4?v={version}"),
+    )
+    .await;
+    let schm = find_box_payload(&hls_init.2, *b"schm").unwrap();
+    assert_eq!(&hls_init.2[schm + 4..schm + 8], b"cbcs");
+
+    h.mapper.state.set(
+        "ladder",
+        Answer::renditions(
+            "v1",
+            &[
+                ("720p", "rendition-720p.mp4"),
+                ("480p", "rendition-480p.mp4"),
+            ],
+        )
+        .with_encryption(cenc_for_dash_encryption(KEY)),
+    );
+    let version = version_in(&fetch(&h.app, "/hls/ladder/master.m3u8").await.2);
+    let mpd = text(&fetch(&h.app, "/dash/ladder/manifest.mpd").await.2);
+    assert!(mpd.contains(r#"value="cenc""#), "{mpd}");
+    let init = fetch(
+        &h.app,
+        &format!("/dash/ladder/video-480p/init.mp4?v={version}"),
+    )
+    .await;
+    let schm = find_box_payload(&init.2, *b"schm").unwrap();
+    assert_eq!(&init.2[schm + 4..schm + 8], b"cenc");
+}
+
+#[tokio::test]
+async fn cenc_for_dash_may_start_with_a_clear_lead_but_not_change_keys() {
+    let h = harness().await;
+    let mut lead = clear_key_encryption(KEY);
+    lead["dash_scheme"] = serde_json::json!("cenc");
+    lead["clear_lead_ms"] = serde_json::json!(1000);
+    h.mapper.state.set(
+        "lead",
+        Answer::file("v1", "h264-aac.mp4").with_encryption(lead),
+    );
+    let master = fetch(&h.app, "/hls/lead/master.m3u8").await;
+    assert_eq!(master.0, StatusCode::OK, "{}", text(&master.2));
+    let version = version_in(&master.2);
+    let mpd = text(&fetch(&h.app, "/dash/lead/manifest.mpd").await.2);
+    assert!(
+        mpd.contains(r#"value="cenc""#) && !mpd.contains(r#"value="cbcs""#),
+        "{mpd}"
+    );
+
+    // The first segment is clear, the rest are cenc: ffmpeg decodes all of it with the key.
+    let first = fetch(
+        &h.app,
+        &format!("/dash/lead/video/segments/0/media.m4s?v={version}"),
+    )
+    .await;
+    assert!(
+        find_box_payload(&first.2, *b"senc").is_none(),
+        "the lead is clear"
+    );
+    let second = fetch(
+        &h.app,
+        &format!("/dash/lead/video/segments/1/media.m4s?v={version}"),
+    )
+    .await;
+    assert!(
+        find_box_payload(&second.2, *b"senc").is_some(),
+        "after the lead it is encrypted"
+    );
+
+    let mut rotating = clear_key_encryption(KEY);
+    rotating["dash_scheme"] = serde_json::json!("cenc");
+    rotating["keys"] = serde_json::json!([]);
+    rotating["periods"] = serde_json::json!([
+        {"start_ms": 0, "keys": [{"key_id": KEY_ID, "key": KEY}]},
+        {"start_ms": 1000, "keys": [{"key_id": KEY_ID_B, "key": KEY_B}]},
+    ]);
+    h.mapper.state.set(
+        "rotating",
+        Answer::file("v1", "h264-aac.mp4").with_encryption(rotating),
+    );
+    assert_eq!(
+        status(&h.app, "/dash/rotating/manifest.mpd").await,
+        StatusCode::BAD_GATEWAY
+    );
+}
+
+#[tokio::test]
+async fn ffmpeg_decodes_the_encrypted_part_of_a_cenc_dash_asset_with_a_clear_lead() {
+    if std::process::Command::new("ffprobe")
+        .arg("-version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipping: ffprobe is not installed");
+        return;
+    }
+    let h = harness().await;
+    let mut lead = clear_key_encryption(KEY);
+    lead["dash_scheme"] = serde_json::json!("cenc");
+    lead["clear_lead_ms"] = serde_json::json!(1000);
+    h.mapper.state.set(
+        "lead",
+        Answer::file("v1", "h264-aac.mp4").with_encryption(lead),
+    );
+    let version = version_in(&fetch(&h.app, "/hls/lead/master.m3u8").await.2);
+    // FFmpeg decrypts every fragment of an encrypted track, so it cannot read the clear lead
+    // (the same holds for `cbcs`); the segments after the lead are what it can judge.
+    let segments = (1..3)
+        .map(|n| format!("segments/{n}/media.m4s?v={version}"))
+        .collect();
+    let clips = vec![(format!("init.mp4?v={version}"), segments)];
+    let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/cenc-lead");
+    let frames = decode_each(&h.app, "/dash/lead/video/", &clips, &directory, Some(KEY)).await;
+    assert_eq!(frames, [60]);
+}
+
+#[tokio::test]
+async fn a_vod_module_asset_is_served_as_cenc_over_dash_when_the_bridge_asks_for_it() {
+    let h = vod_drm_harness_with(0, true).await;
+    set_mapping(&h, &one_file(true));
+    *h.mapper.state.drm_body.lock().unwrap() = Some(drm_info(&DRM_KEY_ID));
+    let master = fetch(&h.app, "/hls/movie/master.m3u8").await;
+    assert_eq!(master.0, StatusCode::OK, "{}", text(&master.2));
+    let version = version_in(&master.2);
+
+    let manifest = text(&fetch(&h.app, "/dash/movie/manifest.mpd").await.2);
+    assert!(manifest.contains(r#"value="cenc""#), "{manifest}");
+    for (protocol, scheme) in [("dash", b"cenc"), ("hls", b"cbcs")] {
+        let init = fetch(
+            &h.app,
+            &format!("/{protocol}/movie/video/init.mp4?v={version}"),
+        )
+        .await
+        .2;
+        let schm = find_box_payload(&init, *b"schm").unwrap();
+        assert_eq!(&init[schm + 4..schm + 8], scheme, "{protocol}");
+    }
 }

@@ -14,6 +14,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use super::parse_track;
 use crate::asset::PackagedAsset;
+use crate::cenc::Delivery;
 use crate::composite::ServedAsset;
 use crate::fmp4::PreparedSegment;
 use crate::http::error::{HttpError, HttpResult};
@@ -90,7 +91,8 @@ pub(crate) async fn init_segment(
     if not_modified(&headers, &etag) {
         return not_modified_response(etag, "public, max-age=31536000, immutable");
     }
-    let bytes = asset.init_segment(requested.rendition.as_deref(), requested.key)?;
+    let delivery = Delivery::of_path(uri.path());
+    let bytes = asset.init_segment(requested.rendition.as_deref(), requested.key, delivery)?;
     let Ok(range) = requested_range(&headers, bytes.len() as u64, &etag) else {
         return range_not_satisfiable(bytes.len() as u64);
     };
@@ -124,6 +126,7 @@ pub(crate) async fn media_segment(
         .await;
     }
     let requested = parse_track(&track)?;
+    let delivery = Delivery::of_path(uri.path());
     let kind = requested.key.kind;
     let what = format!("{asset_id}/{track}/segments/{segment_index}");
     serve_segment(
@@ -139,6 +142,7 @@ pub(crate) async fn media_segment(
                 requested.rendition.as_deref(),
                 requested.key,
                 segment_index,
+                delivery,
             )
         },
     )
@@ -151,6 +155,7 @@ pub(crate) async fn clip_init_segment(
     State(state): State<AppState>,
     Path((asset_id, track, clip)): Path<(String, String, u32)>,
     Query(version): Query<VersionQuery>,
+    uri: Uri,
     headers: HeaderMap,
 ) -> HttpResult<Response> {
     let asset = state.asset(&asset_id).await?;
@@ -161,7 +166,12 @@ pub(crate) async fn clip_init_segment(
         return not_modified_response(etag, "public, max-age=31536000, immutable");
     }
     let clip = usize::try_from(clip).map_err(|_| HttpError::not_found("clip does not exist"))?;
-    let bytes = asset.clip_init_segment(requested.rendition.as_deref(), requested.key, clip)?;
+    let bytes = asset.clip_init_segment(
+        requested.rendition.as_deref(),
+        requested.key,
+        clip,
+        Delivery::of_path(uri.path()),
+    )?;
     let Ok(range) = requested_range(&headers, bytes.len() as u64, &etag) else {
         return range_not_satisfiable(bytes.len() as u64);
     };

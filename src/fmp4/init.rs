@@ -17,9 +17,12 @@ const FTYP: [u8; 24] = *b"\x00\x00\x00\x18ftypiso6\x00\x00\x00\x00iso6mp41";
 /// What an encrypted track's init segment declares (ISO/IEC 23001-7, 8.1 and 8.2).
 pub(crate) struct InitProtection<'a> {
     pub(crate) key_id: [u8; 16],
+    /// `cbcs`: the constant IV declared in `tenc`. Unused by `cenc`.
     pub(crate) constant_iv: [u8; 16],
     pub(crate) crypt_byte_block: u8,
     pub(crate) skip_byte_block: u8,
+    /// `0` for `cbcs`, whose IV is constant; `8` for `cenc`, whose samples each carry their own.
+    pub(crate) per_sample_iv_size: u8,
     /// Complete `pssh` boxes, copied into `moov`.
     pub(crate) pssh: &'a [Vec<u8>],
 }
@@ -297,27 +300,36 @@ fn protect(description: Vec<u8>, protection: Option<&InitProtection<'_>>) -> Res
     Ok(protected)
 }
 
-/// `sinf`: the original format, the `cbcs` scheme, and `tenc` with a constant IV.
+/// `sinf`: the original format, the scheme, and `tenc`: a constant IV for `cbcs`, a per-sample IV
+/// size for `cenc`.
 fn protection_info(original: [u8; 4], protection: &InitProtection<'_>) -> Result<Vec<u8>> {
+    let counter_mode = protection.per_sample_iv_size != 0;
     let mut sinf = Vec::new();
     write_box(&mut sinf, *b"frma", &original)?;
     let mut schm = vec![0; 4];
-    schm.extend_from_slice(b"cbcs");
+    schm.extend_from_slice(if counter_mode { b"cenc" } else { b"cbcs" });
     schm.extend_from_slice(&0x0001_0000u32.to_be_bytes());
     write_box(&mut sinf, *b"schm", &schm)?;
-    let mut tenc = vec![
-        1,
-        0,
-        0,
-        0,
-        0,
-        (protection.crypt_byte_block << 4) | (protection.skip_byte_block & 0x0f),
-        1,
-        0,
-    ];
+    let mut tenc = if counter_mode {
+        // Version 0 has no pattern: both reserved bytes are zero.
+        vec![0, 0, 0, 0, 0, 0, 1, protection.per_sample_iv_size]
+    } else {
+        vec![
+            1,
+            0,
+            0,
+            0,
+            0,
+            (protection.crypt_byte_block << 4) | (protection.skip_byte_block & 0x0f),
+            1,
+            0,
+        ]
+    };
     tenc.extend_from_slice(&protection.key_id);
-    tenc.push(16);
-    tenc.extend_from_slice(&protection.constant_iv);
+    if !counter_mode {
+        tenc.push(16);
+        tenc.extend_from_slice(&protection.constant_iv);
+    }
     let mut scheme_info = Vec::new();
     write_box(&mut scheme_info, *b"tenc", &tenc)?;
     write_box(&mut sinf, *b"schi", &scheme_info)?;
@@ -629,6 +641,7 @@ mod tests {
             constant_iv: [9; 16],
             crypt_byte_block: 1,
             skip_byte_block: 9,
+            per_sample_iv_size: 0,
             pssh: &[],
         };
         let init = write_protected_init_segment(&media.metadata, 1, &protection).unwrap();
@@ -662,6 +675,7 @@ mod tests {
             constant_iv: [2; 16],
             crypt_byte_block: 1,
             skip_byte_block: 9,
+            per_sample_iv_size: 0,
             pssh: std::slice::from_ref(&pssh),
         };
 
@@ -697,5 +711,42 @@ mod tests {
             !plain.windows(4).any(|window| window == b"encv"),
             "the clear writer is unchanged"
         );
+    }
+
+    #[test]
+    fn a_cenc_init_segment_declares_counter_mode_with_an_eight_byte_iv() {
+        let (_, media) = init_for("h264-aac.mp4", 1);
+        let protection = InitProtection {
+            key_id: [1; 16],
+            constant_iv: [2; 16],
+            crypt_byte_block: 1,
+            skip_byte_block: 9,
+            per_sample_iv_size: 8,
+            pssh: &[],
+        };
+
+        let init = write_protected_init_segment(&media.metadata, 1, &protection).unwrap();
+
+        let find = |needle: &[u8]| {
+            init.windows(needle.len())
+                .position(|window| window == needle)
+                .unwrap()
+        };
+        let schm = find(b"schm");
+        assert_eq!(&init[schm + 8..schm + 12], b"cenc");
+        assert_eq!(&init[schm + 12..schm + 16], &0x0001_0000u32.to_be_bytes());
+        let tenc = find(b"tenc");
+        assert_eq!(init[tenc + 4], 0, "tenc version 0 has no pattern");
+        assert_eq!(&init[tenc + 8..tenc + 10], &[0, 0], "reserved, no pattern");
+        assert_eq!(
+            &init[tenc + 10..tenc + 12],
+            &[1, 8],
+            "protected, eight-byte IV"
+        );
+        assert_eq!(&init[tenc + 12..tenc + 28], &[1; 16], "key ID");
+        // The box ends with the key ID: there is no constant IV.
+        let size = u32::from_be_bytes(init[tenc - 4..tenc].try_into().unwrap()) as usize;
+        assert_eq!(size, 32);
+        assert!(box_payload(&init[24..], 0).is_ok());
     }
 }

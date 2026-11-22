@@ -552,10 +552,12 @@ impl HttpResolver {
                 let body = self.read_body(response, drm.max_response_bytes).await?;
                 let clear_lead_ms =
                     u64::from(drm.clear_lead_segments).saturating_mul(self.segment_duration_ms);
-                vod_drm::encryption_from_drm_info(&body, clear_lead_ms).map_err(|reason| {
-                    tracing::warn!(event = "drm_info_rejected", asset.id = asset_id, %reason);
-                    ResolveError::Rejected(reason).into()
-                })
+                vod_drm::encryption_from_drm_info(&body, clear_lead_ms, drm.dash_cenc).map_err(
+                    |reason| {
+                        tracing::warn!(event = "drm_info_rejected", asset.id = asset_id, %reason);
+                        ResolveError::Rejected(reason).into()
+                    },
+                )
             }
             StatusCode::NOT_FOUND | StatusCode::GONE => Err(ResolveError::Rejected(
                 "the key service has no DRM info for this asset".to_owned(),

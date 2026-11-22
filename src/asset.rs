@@ -39,6 +39,8 @@ pub(crate) struct PackagedAsset {
     pub(crate) index: MediaIndex,
     pub(crate) plan: SegmentPlan,
     init_segments: HashMap<TrackKey, Bytes>,
+    /// What DASH is given instead when the asset asks for `cenc` there; empty otherwise.
+    dash_init_segments: HashMap<TrackKey, Bytes>,
     limits: LimitsConfig,
     version: String,
     rendered: RenderedManifests,
@@ -183,29 +185,36 @@ impl PackagedAsset {
         let decryption = crate::cenc::AssetDecryption::new(&index.tracks, source_keys.as_deref())?;
         let plan = segment::plan(&index, segment_duration_ms, limits)?;
         let subtitles = prepare_subtitles(&index, subtitles)?;
+        let source_keys_ref = source_keys.as_deref().filter(|_| decryption.is_some());
+        let version = version.unwrap_or_else(|| {
+            version_of(
+                &index,
+                &subtitles,
+                encryption.as_deref(),
+                hls_aes128.as_deref(),
+                source_keys_ref,
+                tracks,
+                audio.as_ref(),
+            )
+        });
         let protection = encryption
             .map(|encryption| {
-                crate::cenc::AssetProtection::new(encryption, &index.tracks, metadata, &plan)
+                crate::cenc::AssetProtection::new(
+                    encryption,
+                    &index.tracks,
+                    metadata,
+                    &plan,
+                    &version,
+                )
             })
             .transpose()?;
-        let init_segments = index
-            .tracks
-            .iter()
-            .map(|track| {
-                let bytes = match protection
-                    .as_ref()
-                    .and_then(|p| p.track(track.id).map(|t| (p, t)))
-                {
-                    Some((asset, track_protection)) => fmp4::write_protected_init_segment(
-                        metadata,
-                        track.id,
-                        &track_protection.init(&asset.pssh),
-                    ),
-                    None => fmp4::write_init_segment(metadata, track.id),
-                }?;
-                Ok((track.key, Bytes::from(bytes)))
-            })
-            .collect::<Result<HashMap<_, _>>>()?;
+        let init_segments = init_segments_for(
+            &index,
+            metadata,
+            protection.as_ref(),
+            crate::cenc::Scheme::Cbcs,
+        )?;
+        let dash_init_segments = dash_init_segments_for(&index, metadata, protection.as_ref())?;
         // Muxing needs a video and an audio track, and is not offered for encrypted content
         // yet: a fragment would need encryption boxes per track (TDD 0011).
         let muxed = if hls_mux_audio && protection.is_none() && decryption.is_none() {
@@ -234,18 +243,6 @@ impl PackagedAsset {
             None
         };
         let encryption_ref = protection.as_ref().map(|p| p.encryption.as_ref());
-        let source_keys_ref = source_keys.as_deref().filter(|_| decryption.is_some());
-        let version = version.unwrap_or_else(|| {
-            version_of(
-                &index,
-                &subtitles,
-                encryption_ref,
-                hls_aes128.as_deref(),
-                source_keys_ref,
-                tracks,
-                audio.as_ref(),
-            )
-        });
         let rendered = RenderedManifests::render(
             Presentation::new(&index.tracks, &plan, &version)
                 .with_subtitles(&subtitles)
@@ -259,6 +256,7 @@ impl PackagedAsset {
             index,
             plan,
             init_segments,
+            dash_init_segments,
             limits: limits.clone(),
             version,
             rendered,
@@ -400,6 +398,7 @@ impl PackagedAsset {
         segment: TrackSegment,
         segment_index: u32,
         sequence_number: u32,
+        delivery: crate::cenc::Delivery,
         mut prepared: fmp4::PreparedSegment,
     ) -> fmp4::PreparedSegment {
         let protection = self
@@ -418,6 +417,12 @@ impl PackagedAsset {
                         samples,
                         decode_time: segment.decode_time,
                         sequence_number,
+                        scheme: self
+                            .protection
+                            .as_ref()
+                            .map_or(crate::cenc::Scheme::Cbcs, |asset| {
+                                asset.encryption.scheme_for(delivery)
+                            }),
                         protection,
                     })
                 }
@@ -474,8 +479,18 @@ impl PackagedAsset {
         }
     }
 
-    pub(crate) fn init_segment(&self, key: TrackKey) -> Result<Bytes> {
-        self.init_segments
+    pub(crate) fn init_segment(
+        &self,
+        key: TrackKey,
+        delivery: crate::cenc::Delivery,
+    ) -> Result<Bytes> {
+        let segments =
+            if delivery == crate::cenc::Delivery::Dash && !self.dash_init_segments.is_empty() {
+                &self.dash_init_segments
+            } else {
+                &self.init_segments
+            };
+        segments
             .get(&key)
             .cloned()
             .ok_or(Error::NotFound("track does not exist"))
@@ -554,7 +569,14 @@ impl PackagedAsset {
             .checked_add(1)
             .ok_or_else(|| Error::InvalidMedia("sequence number overflow".to_owned()))?;
         let prepared = fmp4::prepare_media_segment(track, segment, sequence_number, &self.limits)?;
-        Ok(self.with_encryption(track, segment, frame_index, sequence_number, prepared))
+        Ok(self.with_encryption(
+            track,
+            segment,
+            frame_index,
+            sequence_number,
+            crate::cenc::Delivery::Hls,
+            prepared,
+        ))
     }
 
     /// The HLS playlist that lists one subtitle file.
@@ -594,10 +616,16 @@ impl PackagedAsset {
         &self,
         key: TrackKey,
         segment_index: u32,
+        delivery: crate::cenc::Delivery,
     ) -> Result<fmp4::PreparedSegment> {
         // The segment is looked up first, so an out-of-range index is still a 404; no plan has
         // `u32::MAX` segments, so the saturation is never observed.
-        self.prepare_numbered_segment(key, segment_index, segment_index.saturating_add(1))
+        self.prepare_numbered_segment(
+            key,
+            segment_index,
+            segment_index.saturating_add(1),
+            delivery,
+        )
     }
 
     /// Like [`Self::prepare_media_segment`], with the fragment's `mfhd` sequence number chosen by
@@ -607,6 +635,7 @@ impl PackagedAsset {
         key: TrackKey,
         segment_index: u32,
         sequence_number: u32,
+        delivery: crate::cenc::Delivery,
     ) -> Result<fmp4::PreparedSegment> {
         let track = self.track(key)?;
         let segment = self
@@ -631,6 +660,7 @@ impl PackagedAsset {
             track_segment,
             segment_index,
             sequence_number,
+            delivery,
             prepared,
         ))
     }
@@ -821,6 +851,45 @@ fn apply_audio_overrides(
 /// The `v` value in media URLs: a hash of everything the index was built from (`moov`, and every
 /// `moof` of a fragmented file), [`FORMAT_REVISION`], and any subtitle files, so changing a
 /// caption gives new URLs.
+/// What DASH is given instead of [`init_segments_for`] when the asset asks for `cenc` there
+/// (TDD 0021); empty otherwise.
+fn dash_init_segments_for(
+    index: &MediaIndex,
+    metadata: &Metadata,
+    protection: Option<&crate::cenc::AssetProtection>,
+) -> Result<HashMap<TrackKey, Bytes>> {
+    match protection {
+        Some(protection) if protection.encryption.dash_scheme == crate::cenc::Scheme::Cenc => {
+            init_segments_for(index, metadata, Some(protection), crate::cenc::Scheme::Cenc)
+        }
+        _ => Ok(HashMap::new()),
+    }
+}
+
+/// Every track's init segment, protected when the asset is encrypted, in `scheme`.
+fn init_segments_for(
+    index: &MediaIndex,
+    metadata: &Metadata,
+    protection: Option<&crate::cenc::AssetProtection>,
+    scheme: crate::cenc::Scheme,
+) -> Result<HashMap<TrackKey, Bytes>> {
+    index
+        .tracks
+        .iter()
+        .map(|track| {
+            let bytes = match protection.and_then(|p| p.track(track.id).map(|t| (p, t))) {
+                Some((asset, track_protection)) => fmp4::write_protected_init_segment(
+                    metadata,
+                    track.id,
+                    &track_protection.init(&asset.pssh, scheme),
+                ),
+                None => fmp4::write_init_segment(metadata, track.id),
+            }?;
+            Ok((track.key, Bytes::from(bytes)))
+        })
+        .collect()
+}
+
 fn version_of(
     index: &MediaIndex,
     subtitles: &[Subtitle],
@@ -1217,9 +1286,11 @@ mod tests {
                 .await
                 .unwrap();
 
-        let plain = asset.prepare_media_segment(TrackKey::VIDEO, 1).unwrap();
+        let plain = asset
+            .prepare_media_segment(TrackKey::VIDEO, 1, crate::cenc::Delivery::Hls)
+            .unwrap();
         let numbered = asset
-            .prepare_numbered_segment(TrackKey::VIDEO, 1, 42)
+            .prepare_numbered_segment(TrackKey::VIDEO, 1, 42, crate::cenc::Delivery::Hls)
             .unwrap();
 
         // moof header (8 bytes), mfhd header (8), version and flags (4), then the number.

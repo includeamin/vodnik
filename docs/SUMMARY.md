@@ -36,6 +36,7 @@
   - [DRM bridge](technical-design/0018-drm-bridge.md)
   - [URL compatibility](technical-design/0019-url-compatibility.md)
   - [Fallback on a miss](technical-design/0020-fallback-on-miss.md)
+  - [cenc for DASH](technical-design/0021-cenc-for-dash.md)
   - [Technical design template](technical-design/template.md)
 
 # Implementation

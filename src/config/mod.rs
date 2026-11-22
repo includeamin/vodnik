@@ -898,6 +898,12 @@ mod tests {
         assert_eq!(drm.extra_args.as_deref(), Some("k=1"));
         assert_eq!(drm.clear_lead_segments, 2);
         assert_eq!(drm.max_response_bytes, 4096);
+        assert!(!drm.dash_cenc, "DASH is cbcs unless asked otherwise");
+        let cenc = mapper_config(&format!("{base}dash_scheme = \"cenc\"")).unwrap();
+        let ResolverSettings::Http(mapper) = &cenc.resolver else {
+            panic!("expected the http resolver");
+        };
+        assert!(mapper.vod_module.drm.as_ref().unwrap().dash_cenc);
         // Without the table there is no key service.
         let plain = mapper_config("base_url = \"https://m.example.net\"\ndialect = \"vod-module\"")
             .unwrap();
@@ -912,6 +918,7 @@ mod tests {
             "extra_args = \"a=1#frag\"",
             "host_header = \"two words\"",
             "max_response_bytes = 0",
+            "dash_scheme = \"cbc1\"",
             "unknown = 1",
         ] {
             mapper_config(&format!("{base}{extra}")).expect_err(extra);

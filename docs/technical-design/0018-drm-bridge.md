@@ -31,7 +31,7 @@ nginx-vod-module's DRM, from its public documentation and the integration guides
 
 ## Non-goals
 
-- `cenc` (AES-CTR) output, `cens` and `cbc1`.
+- `cens` and `cbc1`. `cenc` (AES-CTR) is [TDD 0021](0021-cenc-for-dash.md), chosen with `dash_scheme`.
 - More than one key for an asset (per-track keys), and key rotation across the asset's timeline.
 - Talking to a licence server. vodnik never does; it encrypts with the key it is given and tells players where the system data is.
 - HLS `AES-128` from the key service.
@@ -111,6 +111,6 @@ Additive: without `[resolver.http.vod_module.drm]` nothing changes, and rollback
 ## Open questions
 
 - **`pssh.data` and the answer's exact shape.** Confirm against a real answer; adapt the translation if a deployment's differs.
-- **`cenc`.** Needed if any target device cannot decrypt `cbcs`. A separate design.
+- **`cenc`.** Done in [TDD 0021](0021-cenc-for-dash.md): `dash_scheme = "cenc"` serves DASH as AES-CTR and HLS stays `cbcs`. A change of key is not covered.
 - **Several keys.** A deployment that uses separate video and audio keys would need `keys` with `tracks`, and a way to tell which entry is which.
 - **The clear lead default.** `0` here; nginx-vod-module's own default is not known from its public documentation.

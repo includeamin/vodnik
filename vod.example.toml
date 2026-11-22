@@ -118,6 +118,7 @@ path = "h264-aac.mp4"
 # [resolver.http.vod_module.drm]         # ask the deployment's key service too (cbcs only)
 # path_template = "drm/{id}"
 # clear_lead_segments = 0                # the first N segments are left clear
+# dash_scheme = "cenc"                   # DASH as AES-CTR like nginx-vod-module; HLS stays cbcs
 #
 # [registry]
 # max_cached_resolutions = 10000
