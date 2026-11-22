@@ -461,7 +461,9 @@ pub(crate) fn clear_fragment_header(
 /// The `moof` and `mdat` header of an encrypted fragment: the usual boxes plus `senc`, `saiz`,
 /// and `saio`, which describe each sample's clear and protected bytes (ISO/IEC 23001-7, 7.2).
 /// An empty map means a whole-sample (audio) encryption with no subsamples. `rotation` adds what
-/// a fragment under another key than the init segment's needs (TDD 0013).
+/// a fragment under another key than the init segment's needs (TDD 0013). `ivs` is each sample's
+/// own IV for `cenc` (TDD 0021), written ahead of its subsamples; empty for `cbcs`, whose IV is
+/// constant.
 #[allow(
     clippy::too_many_arguments,
     reason = "each is a distinct fragment field; a struct would only rename them"
@@ -473,12 +475,13 @@ pub(crate) fn encrypted_fragment_header(
     decode_time: u64,
     sequence_number: u32,
     subsamples: &[Vec<(u16, u32)>],
+    ivs: &[[u8; 8]],
     payload_len: usize,
     rotation: Option<&FragmentRotation>,
 ) -> Result<Vec<u8>> {
     let overflow = || Error::InvalidMedia("encrypted fragment is too large".to_owned());
     let (groups, moof_extra) = rotation_boxes(rotation, samples.len())?;
-    let mut probe_extra = encryption_boxes(subsamples, 0)?;
+    let mut probe_extra = encryption_boxes(subsamples, ivs, 0)?;
     probe_extra.extend_from_slice(&groups);
     let probe = build_moof(
         track_id,
@@ -496,6 +499,7 @@ pub(crate) fn encrypted_fragment_header(
     let senc_entries = probe.len() - probe_extra.len() + 16;
     let mut extra = encryption_boxes(
         subsamples,
+        ivs,
         u32::try_from(senc_entries).map_err(|_| overflow())?,
     )?;
     extra.extend_from_slice(&groups);
@@ -519,17 +523,30 @@ pub(crate) fn encrypted_fragment_header(
     Ok(header)
 }
 
-fn encryption_boxes(subsamples: &[Vec<(u16, u32)>], aux_offset: u32) -> Result<Vec<u8>> {
+fn encryption_boxes(
+    subsamples: &[Vec<(u16, u32)>],
+    ivs: &[[u8; 8]],
+    aux_offset: u32,
+) -> Result<Vec<u8>> {
     let invalid = |message: &str| Error::InvalidMedia(message.to_owned());
+    if !ivs.is_empty() && ivs.len() != subsamples.len() {
+        return Err(invalid("a sample has no IV"));
+    }
     let use_subsamples = subsamples.iter().any(|map| !map.is_empty());
     let count = u32::try_from(subsamples.len()).map_err(|_| invalid("too many samples"))?;
     let mut senc = Vec::new();
     write_full_box_fields(&mut senc, 0, if use_subsamples { 2 } else { 0 });
     senc.extend_from_slice(&count.to_be_bytes());
     let mut sizes = Vec::with_capacity(subsamples.len());
-    for map in subsamples {
+    for (index, map) in subsamples.iter().enumerate() {
+        let iv_bytes = if let Some(iv) = ivs.get(index) {
+            senc.extend_from_slice(iv);
+            u8::try_from(iv.len()).map_err(|_| invalid("IV too long"))?
+        } else {
+            0
+        };
         if !use_subsamples {
-            sizes.push(0u8);
+            sizes.push(iv_bytes);
             continue;
         }
         if map.len() > MAX_SUBSAMPLES {
@@ -543,7 +560,10 @@ fn encryption_boxes(subsamples: &[Vec<(u16, u32)>], aux_offset: u32) -> Result<V
             senc.extend_from_slice(&clear.to_be_bytes());
             senc.extend_from_slice(&protected.to_be_bytes());
         }
-        sizes.push(u8::try_from(2 + 6 * map.len()).map_err(|_| invalid("too many subsamples"))?);
+        sizes.push(
+            u8::try_from(usize::from(iv_bytes) + 2 + 6 * map.len())
+                .map_err(|_| invalid("too many subsamples"))?,
+        );
     }
     let mut aux_sizes = Vec::new();
     write_full_box_fields(&mut aux_sizes, 0, 0);
@@ -593,9 +613,18 @@ mod tests {
         let samples = [sample(100), sample(60)];
         let subsamples = vec![vec![(10, 90)], vec![(5, 20), (7, 28)]];
 
-        let header =
-            encrypted_fragment_header(1, TrackKind::Video, &samples, 0, 3, &subsamples, 160, None)
-                .unwrap();
+        let header = encrypted_fragment_header(
+            1,
+            TrackKind::Video,
+            &samples,
+            0,
+            3,
+            &subsamples,
+            &[],
+            160,
+            None,
+        )
+        .unwrap();
 
         let senc = position(&header, *b"senc");
         assert_eq!(
@@ -634,6 +663,7 @@ mod tests {
             0,
             1,
             &[vec![], vec![]],
+            &[],
             100,
             None,
         )
@@ -643,5 +673,66 @@ mod tests {
         assert_eq!(&header[senc + 8..senc + 16], &[0, 0, 0, 0, 0, 0, 0, 2]);
         let saiz = position(&header, *b"saiz");
         assert_eq!(&header[saiz + 12..saiz + 19], &[0, 0, 0, 0, 2, 0, 0]);
+    }
+
+    #[test]
+    fn cenc_writes_each_samples_iv_ahead_of_its_subsamples() {
+        let samples = [sample(100), sample(60)];
+        let subsamples = vec![vec![(10, 90)], vec![(5, 20), (7, 28)]];
+        let ivs = [[1u8; 8], [2u8; 8]];
+
+        let header = encrypted_fragment_header(
+            1,
+            TrackKind::Video,
+            &samples,
+            0,
+            3,
+            &subsamples,
+            &ivs,
+            160,
+            None,
+        )
+        .unwrap();
+
+        let senc = position(&header, *b"senc");
+        assert_eq!(&header[senc + 8..senc + 12], &[0, 0, 0, 2]);
+        assert_eq!(&header[senc + 16..senc + 24], &[1; 8], "first sample's IV");
+        assert_eq!(&header[senc + 24..senc + 32], &[0, 1, 0, 10, 0, 0, 0, 90]);
+        assert_eq!(&header[senc + 32..senc + 40], &[2; 8], "second sample's IV");
+        let saiz = position(&header, *b"saiz");
+        // Eight bytes of IV, two of count and six per subsample.
+        assert_eq!(&header[saiz + 13..saiz + 19], &[0, 0, 0, 2, 16, 22]);
+        let offsets = position(&header, *b"saio");
+        let offset = u32::from_be_bytes(header[offsets + 16..offsets + 20].try_into().unwrap());
+        assert_eq!(offset as usize, senc + 16, "saio points at the first IV");
+    }
+
+    #[test]
+    fn cenc_audio_has_only_ivs_of_one_uniform_size() {
+        let samples = [sample(50), sample(50)];
+
+        let header = encrypted_fragment_header(
+            2,
+            TrackKind::Audio,
+            &samples,
+            0,
+            1,
+            &[vec![], vec![]],
+            &[[3; 8], [4; 8]],
+            100,
+            None,
+        )
+        .unwrap();
+
+        let senc = position(&header, *b"senc");
+        assert_eq!(&header[senc + 8..senc + 12], &[0, 0, 0, 0], "no subsamples");
+        assert_eq!(&header[senc + 16..senc + 24], &[3; 8]);
+        assert_eq!(&header[senc + 24..senc + 32], &[4; 8]);
+        let saiz = position(&header, *b"saiz");
+        assert_eq!(
+            &header[saiz + 12..saiz + 17],
+            &[8, 0, 0, 0, 2],
+            "uniform size 8"
+        );
     }
 }

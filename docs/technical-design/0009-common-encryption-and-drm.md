@@ -50,7 +50,7 @@ The mapper already carries per-asset secrets under HTTPS and a bearer token, has
 ## Non-goals
 
 - Licence servers, key generation, or talking to a DRM vendor. The operator's mapper supplies keys and system data.
-- The `cenc` (AES-CTR), `cbc1`, and `cens` schemes.
+- The `cbc1` and `cens` schemes. `cenc` for DASH came later: [TDD 0021](0021-cenc-for-dash.md).
 - AV1, VP9, Opus, and FLAC encryption in this stage.
 - Key rotation, whole-segment HLS AES-128, encrypted source passthrough, and SPEKE. See [Deferred](#deferred).
 

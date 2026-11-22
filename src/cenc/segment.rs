@@ -5,12 +5,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use sha2::{Digest, Sha256};
 
 use super::aes128::Aes128;
 use super::avc::AvcParameters;
-use super::cipher::{Cipher, Pattern};
+use super::cipher::{Cipher, CtrStream, Pattern};
 use super::hevc::HevcParameters;
-use super::keys::{ContentKey, Encryption};
+use super::keys::{ContentKey, Encryption, Scheme};
 use super::source::TrackDecryption;
 use crate::error::{Error, Result};
 use crate::fmp4::{self, FragmentRotation, InitProtection, MAX_SUBSAMPLES, SampleGroup};
@@ -28,6 +29,9 @@ pub(crate) struct TrackProtection {
     /// What a fragment under this key says about it when the key is not the init segment's
     /// (TDD 0013).
     pub(crate) rotation: Option<Arc<FragmentRotation>>,
+    /// What `cenc` derives a sample's IV from, together with where the sample is (TDD 0021). It
+    /// names the asset's version, so two assets that share a key never share a keystream.
+    iv_salt: [u8; 32],
 }
 
 /// The parameter sets of a video track, by codec.
@@ -45,15 +49,36 @@ impl TrackProtection {
         }
     }
 
-    pub(crate) fn init<'a>(&self, pssh: &'a [Vec<u8>]) -> InitProtection<'a> {
-        let pattern = self.pattern();
+    pub(crate) fn init<'a>(&self, pssh: &'a [Vec<u8>], scheme: Scheme) -> InitProtection<'a> {
+        let pattern = match scheme {
+            Scheme::Cbcs => self.pattern(),
+            Scheme::Cenc => Pattern::FULL,
+        };
         InitProtection {
             key_id: self.key.key_id,
             constant_iv: self.key.iv,
             crypt_byte_block: pattern.crypt,
             skip_byte_block: pattern.skip,
+            per_sample_iv_size: match scheme {
+                Scheme::Cbcs => 0,
+                Scheme::Cenc => 8,
+            },
             pssh,
         }
+    }
+
+    /// A `cenc` sample's IV: the first eight bytes of a hash of the asset, the track, and the
+    /// sample's place in the file and on the timeline. Every replica derives the same bytes, and
+    /// no two samples under one key share a counter block.
+    fn sample_iv(&self, sample: &Sample) -> [u8; 8] {
+        let mut hasher = Sha256::new();
+        hasher.update(self.iv_salt);
+        hasher.update(sample.offset.to_be_bytes());
+        hasher.update(sample.decode_time.to_be_bytes());
+        let digest = hasher.finalize();
+        digest[..8]
+            .try_into()
+            .expect("a hash is longer than eight bytes")
     }
 }
 
@@ -96,10 +121,17 @@ impl AssetProtection {
         tracks: &[Track],
         metadata: &Metadata,
         plan: &SegmentPlan,
+        version: &str,
     ) -> Result<Self> {
         let rotating = encryption.is_rotating();
-        let primary =
-            Self::track_protections(&encryption, &encryption, tracks, metadata, rotating)?;
+        let primary = Self::track_protections(
+            &encryption,
+            &encryption,
+            tracks,
+            metadata,
+            rotating,
+            version,
+        )?;
         let pssh = system_pssh(&encryption);
         let mut periods = Vec::new();
         if rotating {
@@ -111,6 +143,7 @@ impl AssetProtection {
                         tracks,
                         metadata,
                         true,
+                        version,
                     )?),
                     None => PeriodContent::Clear(Arc::new(FragmentRotation {
                         group: Some(SampleGroup::Clear),
@@ -139,6 +172,7 @@ impl AssetProtection {
         tracks: &[Track],
         metadata: &Metadata,
         rotating: bool,
+        version: &str,
     ) -> Result<HashMap<u32, Arc<TrackProtection>>> {
         let mut protected = HashMap::with_capacity(tracks.len());
         for track in tracks {
@@ -166,11 +200,17 @@ impl AssetProtection {
                 }
             };
             let key = period.key_for(track.kind).clone();
+            let mut hasher = Sha256::new();
+            hasher.update(b"vodnik cenc iv");
+            hasher.update(version.as_bytes());
+            hasher.update(key.key_id);
+            hasher.update(track.id.to_be_bytes());
             let mut protection = TrackProtection {
                 key,
                 kind: track.kind,
                 video,
                 rotation: None,
+                iv_salt: hasher.finalize().into(),
             };
             if rotating {
                 let group = (protection.key != *primary.key_for(track.kind)).then(|| {
@@ -369,6 +409,9 @@ pub(crate) struct PendingCbcs {
     pub(crate) decode_time: u64,
     pub(crate) sequence_number: u32,
     pub(crate) protection: Arc<TrackProtection>,
+    /// How the samples are encrypted. Despite the type's name, `cenc` goes through it too: the
+    /// two schemes differ only in the cipher and in what the fragment says about the IV.
+    pub(crate) scheme: Scheme,
 }
 
 impl PendingCbcs {
@@ -394,6 +437,8 @@ impl PendingCbcs {
         let cipher = Cipher::new(self.protection.key.key.bytes());
         let iv = self.protection.key.iv;
         let pattern = self.protection.pattern();
+        let counter_mode = self.scheme == Scheme::Cenc;
+        let mut ivs = Vec::new();
         let mut maps = Vec::with_capacity(self.samples.len());
         let mut offset = 0;
         for sample in &self.samples {
@@ -404,15 +449,24 @@ impl PendingCbcs {
                 Some(VideoParameters::Hevc(hevc)) => hevc_subsamples(hevc, bytes)?,
                 None => Vec::new(),
             };
+            let mut counter = counter_mode.then(|| {
+                let sample_iv = self.protection.sample_iv(sample);
+                ivs.push(sample_iv);
+                CtrStream::new(&cipher, sample_iv)
+            });
+            let mut protect = |range: &mut [u8]| match counter.as_mut() {
+                Some(stream) => stream.apply(range),
+                None => cipher.encrypt_range(&iv, range, pattern),
+            };
             if map.is_empty() {
-                cipher.encrypt_range(&iv, bytes, pattern);
+                protect(bytes);
             } else {
                 let mut at = 0;
                 for &(clear, protected) in &map {
                     at += usize::from(clear);
                     let end =
                         at + usize::try_from(protected).map_err(|_| invalid("range too large"))?;
-                    cipher.encrypt_range(&iv, &mut bytes[at..end], pattern);
+                    protect(&mut bytes[at..end]);
                     at = end;
                 }
             }
@@ -426,6 +480,7 @@ impl PendingCbcs {
             self.decode_time,
             self.sequence_number,
             &maps,
+            &ivs,
             payload.len(),
             self.protection.rotation.as_deref(),
         )?;

@@ -326,11 +326,16 @@ impl SequenceAsset {
             .ok_or(Error::NotFound("track does not exist"))
     }
 
-    pub(crate) fn clip_init_segment(&self, key: TrackKey, clip: usize) -> Result<Bytes> {
+    pub(crate) fn clip_init_segment(
+        &self,
+        key: TrackKey,
+        clip: usize,
+        delivery: crate::cenc::Delivery,
+    ) -> Result<Bytes> {
         self.clips
             .get(clip)
             .ok_or(Error::NotFound("clip does not exist"))?
-            .init_segment(key)
+            .init_segment(key, delivery)
     }
 
     /// The fragment for global segment `segment_index`, and the clip whose bytes it reads.
@@ -338,6 +343,7 @@ impl SequenceAsset {
         &self,
         key: TrackKey,
         segment_index: u32,
+        delivery: crate::cenc::Delivery,
     ) -> Result<(Arc<PackagedAsset>, PreparedSegment)> {
         // `first_segments[0]` is 0, so at least one clip starts at or before any index.
         let clip = self
@@ -346,8 +352,12 @@ impl SequenceAsset {
             - 1;
         let local = segment_index - self.first_segments[clip];
         let asset = &self.clips[clip];
-        let prepared =
-            asset.prepare_numbered_segment(key, local, segment_index.saturating_add(1))?;
+        let prepared = asset.prepare_numbered_segment(
+            key,
+            local,
+            segment_index.saturating_add(1),
+            delivery,
+        )?;
         Ok((Arc::clone(asset), prepared))
     }
 
@@ -457,8 +467,12 @@ mod tests {
         let asset = build_from(&files, &[(0, WHOLE), (0, WHOLE)]).unwrap();
         let sequence = sequence(&asset);
 
-        let (_, first) = sequence.prepare_segment(TrackKey::VIDEO, 0).unwrap();
-        let (_, fourth) = sequence.prepare_segment(TrackKey::VIDEO, 3).unwrap();
+        let (_, first) = sequence
+            .prepare_segment(TrackKey::VIDEO, 0, crate::cenc::Delivery::Hls)
+            .unwrap();
+        let (_, fourth) = sequence
+            .prepare_segment(TrackKey::VIDEO, 3, crate::cenc::Delivery::Hls)
+            .unwrap();
 
         assert_eq!(
             fourth.ranges, first.ranges,
@@ -470,7 +484,7 @@ mod tests {
             "numbered across the sequence"
         );
         assert!(matches!(
-            sequence.prepare_segment(TrackKey::VIDEO, 6),
+            sequence.prepare_segment(TrackKey::VIDEO, 6, crate::cenc::Delivery::Hls),
             Err(Error::NotFound(_))
         ));
         assert_eq!(asset.segment_count(), 6);
@@ -482,9 +496,15 @@ mod tests {
         let asset = build_from(&files, &[(0, WHOLE), (0, WHOLE)]).unwrap();
         let sequence = sequence(&asset);
 
-        let (_, last_of_first) = sequence.prepare_segment(TrackKey::VIDEO, 2).unwrap();
-        let (_, first_of_second) = sequence.prepare_segment(TrackKey::VIDEO, 3).unwrap();
-        let (_, audio) = sequence.prepare_segment(TrackKey::audio(1), 3).unwrap();
+        let (_, last_of_first) = sequence
+            .prepare_segment(TrackKey::VIDEO, 2, crate::cenc::Delivery::Hls)
+            .unwrap();
+        let (_, first_of_second) = sequence
+            .prepare_segment(TrackKey::VIDEO, 3, crate::cenc::Delivery::Hls)
+            .unwrap();
+        let (_, audio) = sequence
+            .prepare_segment(TrackKey::audio(1), 3, crate::cenc::Delivery::Hls)
+            .unwrap();
 
         // 90 frames of 512 ticks: the first clip ends at 46080 (3 s), where the second begins.
         assert_eq!(tfdt(&last_of_first.header), 30_720);
@@ -503,7 +523,9 @@ mod tests {
 
         let master = String::from_utf8(asset.hls_master_playlist().to_vec()).unwrap();
         assert!(master.contains("RESOLUTION=640x360"), "{master}");
-        let init = asset.clip_init_segment(None, TrackKey::VIDEO, 1).unwrap();
+        let init = asset
+            .clip_init_segment(None, TrackKey::VIDEO, 1, crate::cenc::Delivery::Hls)
+            .unwrap();
         assert_eq!(&init[4..8], b"ftyp");
     }
 
@@ -551,7 +573,11 @@ mod tests {
             plain.version(),
             "a clip's window is part of its version"
         );
-        assert!(asset.init_segment(None, TrackKey::VIDEO).is_ok());
+        assert!(
+            asset
+                .init_segment(None, TrackKey::VIDEO, crate::cenc::Delivery::Hls)
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -561,19 +587,21 @@ mod tests {
         let asset = build_from(&files, &[(0, WHOLE), (0, WHOLE)]).unwrap();
 
         assert!(matches!(
-            asset.init_segment(None, TrackKey::VIDEO),
+            asset.init_segment(None, TrackKey::VIDEO, crate::cenc::Delivery::Hls),
             Err(Error::NotFound(_))
         ));
         assert_eq!(
-            &asset.clip_init_segment(None, TrackKey::VIDEO, 1).unwrap()[4..8],
+            &asset
+                .clip_init_segment(None, TrackKey::VIDEO, 1, crate::cenc::Delivery::Hls)
+                .unwrap()[4..8],
             b"ftyp"
         );
         assert!(matches!(
-            asset.clip_init_segment(None, TrackKey::VIDEO, 2),
+            asset.clip_init_segment(None, TrackKey::VIDEO, 2, crate::cenc::Delivery::Hls),
             Err(Error::NotFound(_))
         ));
         assert!(matches!(
-            asset.clip_init_segment(Some("720p"), TrackKey::VIDEO, 0),
+            asset.clip_init_segment(Some("720p"), TrackKey::VIDEO, 0, crate::cenc::Delivery::Hls),
             Err(Error::NotFound(_))
         ));
         assert!(matches!(

@@ -73,9 +73,40 @@ pub(crate) struct DrmSystem {
     pub(crate) hls_uri: Option<String>,
 }
 
+/// How the samples are encrypted: the scheme named in `schm` (ISO/IEC 23001-7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Scheme {
+    /// AES-CBC with a 1:9 pattern for video and a constant IV: the scheme of HLS and of DASH by
+    /// default.
+    #[default]
+    Cbcs,
+    /// AES-CTR with a per-sample IV (TDD 0021), offered for DASH only.
+    Cenc,
+}
+
+/// Which protocol a segment is served for: what decides its scheme (TDD 0021).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Delivery {
+    Hls,
+    Dash,
+}
+
+impl Delivery {
+    /// From a request path, `/dash/...` or anything else.
+    pub(crate) fn of_path(path: &str) -> Self {
+        if path.starts_with("/dash/") {
+            Self::Dash
+        } else {
+            Self::Hls
+        }
+    }
+}
+
 /// What the mapper's `encryption` object asks for, validated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Encryption {
+    /// The scheme DASH segments use. HLS is always `cbcs`: Apple's players decrypt nothing else.
+    pub(crate) dash_scheme: Scheme,
     /// The keys of the first encrypted period: the ones the init segment's `tenc` declares. For
     /// an asset without rotation, the only ones.
     pub(crate) keys: Keys,
@@ -108,6 +139,14 @@ impl Encryption {
             Keys::All(key) => vec![key],
             Keys::Split { video, audio } if video == audio => vec![video],
             Keys::Split { video, audio } => vec![video, audio],
+        }
+    }
+
+    /// The scheme the samples of `delivery` are encrypted with.
+    pub(crate) const fn scheme_for(&self, delivery: Delivery) -> Scheme {
+        match delivery {
+            Delivery::Dash => self.dash_scheme,
+            Delivery::Hls => Scheme::Cbcs,
         }
     }
 
@@ -149,6 +188,9 @@ impl Encryption {
             hasher.update((part.len() as u64).to_be_bytes());
             hasher.update(part);
         };
+        if self.dash_scheme == Scheme::Cenc {
+            feed(b"dash cenc");
+        }
         for key in self.distinct_keys() {
             feed(&key.key_id);
             feed(&Sha256::digest(key.key.bytes()));
@@ -176,6 +218,10 @@ impl Encryption {
 #[derive(Debug, Deserialize)]
 pub(crate) struct WireEncryption {
     scheme: String,
+    /// `cenc` serves DASH under AES-CTR while HLS stays `cbcs` (TDD 0021); `cbcs`, the default,
+    /// serves both the same way.
+    #[serde(default)]
+    dash_scheme: Option<String>,
     #[serde(default)]
     keys: Vec<WireKey>,
     #[serde(default)]
@@ -234,6 +280,31 @@ impl WireEncryption {
     /// Checks every rule of TDD 0009's wire format. The reason names the field, never its value,
     /// so a rejected answer cannot leak a key into a log or an error body.
     pub(crate) fn validate(&self) -> Result<Encryption, String> {
+        let dash_scheme = match self.dash_scheme.as_deref() {
+            None | Some("cbcs") => Scheme::Cbcs,
+            Some("cenc") => Scheme::Cenc,
+            Some(_) => return Err("encryption dash_scheme must be cbcs or cenc".to_owned()),
+        };
+        let mut encryption = self.validate_keys()?;
+        if dash_scheme == Scheme::Cenc {
+            // A clear stretch before or between uses of one key needs nothing more than `cbcs`
+            // does; a change of key needs a sample group `cenc` does not write yet (TDD 0021).
+            if encryption.key_ids().len() > 1 {
+                return Err(
+                    "encryption dash_scheme cenc cannot change keys between periods".to_owned(),
+                );
+            }
+            encryption.dash_scheme = Scheme::Cenc;
+            for period in &mut encryption.periods {
+                if let Some(content) = &mut period.encryption {
+                    content.dash_scheme = Scheme::Cenc;
+                }
+            }
+        }
+        Ok(encryption)
+    }
+
+    fn validate_keys(&self) -> Result<Encryption, String> {
         if self.scheme != "cbcs" {
             return Err("encryption scheme is not supported; only cbcs is".to_owned());
         }
@@ -282,6 +353,7 @@ fn single_period(keys: &[WireKey], systems: &[WireSystem]) -> Result<Encryption,
         );
     }
     Ok(Encryption {
+        dash_scheme: Scheme::Cbcs,
         keys,
         systems,
         periods: Vec::new(),
@@ -920,5 +992,65 @@ mod tests {
         );
         let error = wire(&timeline_json(&[split])).validate().unwrap_err();
         assert!(error.contains("FairPlay"), "{error}");
+    }
+
+    #[test]
+    fn dash_scheme_defaults_to_cbcs_and_cenc_is_opt_in() {
+        let plain = wire(&one_key("")).validate().unwrap();
+        assert_eq!(plain.dash_scheme, Scheme::Cbcs);
+        assert_eq!(plain.scheme_for(Delivery::Dash), Scheme::Cbcs);
+        let explicit = wire(&one_key(r#","dash_scheme":"cbcs""#))
+            .validate()
+            .unwrap();
+        assert_eq!(explicit, plain);
+
+        let cenc = wire(&one_key(r#","dash_scheme":"cenc""#))
+            .validate()
+            .unwrap();
+        assert_eq!(cenc.scheme_for(Delivery::Dash), Scheme::Cenc);
+        // HLS is always cbcs: Apple's players decrypt nothing else.
+        assert_eq!(cenc.scheme_for(Delivery::Hls), Scheme::Cbcs);
+        assert_eq!(cenc.keys, plain.keys);
+    }
+
+    #[test]
+    fn the_dash_scheme_changes_the_url_version() {
+        let plain = wire(&one_key("")).validate().unwrap();
+        let cenc = wire(&one_key(r#","dash_scheme":"cenc""#))
+            .validate()
+            .unwrap();
+        assert_ne!(plain.fingerprint(), cenc.fingerprint());
+    }
+
+    #[test]
+    fn an_unknown_dash_scheme_or_cenc_with_a_key_change_is_refused() {
+        let error = wire(&one_key(r#","dash_scheme":"cbc1""#))
+            .validate()
+            .unwrap_err();
+        assert!(error.contains("dash_scheme must be"), "{error}");
+        let periods = format!(
+            r#"{{"scheme":"cbcs","dash_scheme":"cenc","periods":[{{"start_ms":0,"keys":[{{"key_id":"{KID}","key":"{KEY}"}}]}},{{"start_ms":1000,"keys":[{{"key_id":"fedcba9876543210fedcba9876543210","key":"{KEY}"}}]}}]}}"#
+        );
+        let error = wire(&periods).validate().unwrap_err();
+        assert!(error.contains("cannot change keys"), "{error}");
+        assert!(!error.contains(KEY), "an error never carries a key");
+    }
+
+    #[test]
+    fn cenc_allows_a_clear_lead_under_one_key_in_every_period() {
+        let lead = wire(&one_key(r#","dash_scheme":"cenc","clear_lead_ms":2000"#))
+            .validate()
+            .unwrap();
+        assert!(lead.is_rotating());
+        assert_eq!(lead.scheme_for(Delivery::Dash), Scheme::Cenc);
+        for period in &lead.periods {
+            if let Some(content) = &period.encryption {
+                assert_eq!(
+                    content.dash_scheme,
+                    Scheme::Cenc,
+                    "DASH signals each period"
+                );
+            }
+        }
     }
 }

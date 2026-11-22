@@ -678,9 +678,10 @@ impl AdaptiveSequenceAsset {
         rendition: Option<&str>,
         key: TrackKey,
         clip: usize,
+        delivery: crate::cenc::Delivery,
     ) -> Result<Bytes> {
         let (asset, internal) = self.resolve(rendition, key, clip)?;
-        asset.init_segment(internal)
+        asset.init_segment(internal, delivery)
     }
 
     /// The fragment for global segment `segment_index` of a track, and the asset whose bytes it
@@ -690,6 +691,7 @@ impl AdaptiveSequenceAsset {
         rendition: Option<&str>,
         key: TrackKey,
         segment_index: u32,
+        delivery: crate::cenc::Delivery,
     ) -> Result<(Arc<PackagedAsset>, PreparedSegment)> {
         let firsts: &[u32] = match key.kind {
             TrackKind::Video => &self.first_video,
@@ -702,8 +704,12 @@ impl AdaptiveSequenceAsset {
         let clip = firsts.partition_point(|&first| first <= segment_index) - 1;
         let local = segment_index - firsts[clip];
         let (asset, internal) = self.resolve(rendition, key, clip)?;
-        let prepared =
-            asset.prepare_numbered_segment(internal, local, segment_index.saturating_add(1))?;
+        let prepared = asset.prepare_numbered_segment(
+            internal,
+            local,
+            segment_index.saturating_add(1),
+            delivery,
+        )?;
         Ok((asset, prepared))
     }
 
@@ -951,17 +957,27 @@ mod tests {
 
         for id in ["720p", "480p"] {
             let (_, first) = adaptive
-                .prepare_segment(Some(id), TrackKey::VIDEO, 0)
+                .prepare_segment(Some(id), TrackKey::VIDEO, 0, crate::cenc::Delivery::Hls)
                 .unwrap();
             let (_, boundary) = adaptive
-                .prepare_segment(Some(id), TrackKey::VIDEO, adaptive.first_video[1])
+                .prepare_segment(
+                    Some(id),
+                    TrackKey::VIDEO,
+                    adaptive.first_video[1],
+                    crate::cenc::Delivery::Hls,
+                )
                 .unwrap();
             assert_ne!(
                 boundary.ranges, first.ranges,
                 "{id}: the second clip's bytes"
             );
             let (_, last) = adaptive
-                .prepare_segment(Some(id), TrackKey::VIDEO, total - 1)
+                .prepare_segment(
+                    Some(id),
+                    TrackKey::VIDEO,
+                    total - 1,
+                    crate::cenc::Delivery::Hls,
+                )
                 .unwrap();
             assert_eq!(
                 &last.header[20..24],
@@ -969,12 +985,17 @@ mod tests {
                 "{id}: numbered across the sequence"
             );
             assert!(matches!(
-                adaptive.prepare_segment(Some(id), TrackKey::VIDEO, total),
+                adaptive.prepare_segment(
+                    Some(id),
+                    TrackKey::VIDEO,
+                    total,
+                    crate::cenc::Delivery::Hls
+                ),
                 Err(Error::NotFound(_))
             ));
         }
         assert!(matches!(
-            adaptive.prepare_segment(Some("nope"), TrackKey::VIDEO, 0),
+            adaptive.prepare_segment(Some("nope"), TrackKey::VIDEO, 0, crate::cenc::Delivery::Hls),
             Err(Error::NotFound(_))
         ));
     }
@@ -1054,16 +1075,21 @@ mod tests {
         }
         assert!(
             adaptive
-                .clip_init_segment(Some("720p"), TrackKey::VIDEO, 1)
+                .clip_init_segment(Some("720p"), TrackKey::VIDEO, 1, crate::cenc::Delivery::Hls)
                 .is_ok()
         );
         assert!(
             adaptive
-                .clip_init_segment(None, TrackKey::audio(1), 1)
+                .clip_init_segment(None, TrackKey::audio(1), 1, crate::cenc::Delivery::Hls)
                 .is_ok()
         );
         assert!(matches!(
-            adaptive.clip_init_segment(Some("720p"), TrackKey::VIDEO, 2),
+            adaptive.clip_init_segment(
+                Some("720p"),
+                TrackKey::VIDEO,
+                2,
+                crate::cenc::Delivery::Hls
+            ),
             Err(Error::NotFound(_))
         ));
     }

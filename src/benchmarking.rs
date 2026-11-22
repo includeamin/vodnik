@@ -57,7 +57,7 @@ impl BenchAsset {
     /// Returns the failure message if the segment does not exist.
     pub fn prepare_video_segment(&self, index: u32) -> Result<u64, String> {
         self.0
-            .prepare_media_segment(TrackKey::VIDEO, index)
+            .prepare_media_segment(TrackKey::VIDEO, index, crate::cenc::Delivery::Hls)
             .map(|prepared| prepared.content_length)
             .map_err(|error| error.to_string())
     }

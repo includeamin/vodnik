@@ -14,7 +14,7 @@ mod source;
 mod source_keys;
 
 pub(crate) use aes128::{Aes128, WireAes128};
-pub(crate) use keys::{Encryption, WireEncryption};
+pub(crate) use keys::{Delivery, Encryption, Scheme, WireEncryption};
 pub(crate) use schedule::{ScheduledPeriod, schedule};
 pub(crate) use segment::{
     AssetProtection, PendingCbcs, PendingClear, PendingDecrypt, PendingEncryption,

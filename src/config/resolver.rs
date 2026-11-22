@@ -97,6 +97,8 @@ struct RawVodDrm {
     extra_args: Option<String>,
     host_header: Option<String>,
     clear_lead_segments: u32,
+    /// `cbcs` (the default) or `cenc`: what DASH segments use; HLS is always `cbcs` (TDD 0021).
+    dash_scheme: String,
     max_response_bytes: usize,
 }
 
@@ -107,6 +109,7 @@ impl Default for RawVodDrm {
             extra_args: None,
             host_header: None,
             clear_lead_segments: 0,
+            dash_scheme: "cbcs".to_owned(),
             max_response_bytes: 16 * 1024,
         }
     }
@@ -122,6 +125,8 @@ pub(crate) struct VodDrmConfig {
     /// How many of an asset's first segments are left clear
     /// (nginx-vod-module's `vod_drm_clear_lead_segment_count`).
     pub(crate) clear_lead_segments: u32,
+    /// Serve DASH under `cenc` (AES-CTR), as nginx-vod-module does; HLS stays `cbcs` (TDD 0021).
+    pub(crate) dash_cenc: bool,
     pub(crate) max_response_bytes: usize,
 }
 
@@ -132,6 +137,7 @@ impl Default for VodDrmConfig {
             extra_args: None,
             host_header: None,
             clear_lead_segments: 0,
+            dash_cenc: false,
             max_response_bytes: 16 * 1024,
         }
     }
@@ -173,11 +179,21 @@ impl RawVodDrm {
                 "resolver.http.vod_module.drm.max_response_bytes must be greater than zero",
             );
         }
+        let dash_cenc = match self.dash_scheme.as_str() {
+            "cbcs" => false,
+            "cenc" => true,
+            _ => {
+                return fail(
+                    "resolver.http.vod_module.drm.dash_scheme must be \"cbcs\" or \"cenc\"",
+                );
+            }
+        };
         Ok(VodDrmConfig {
             path_template: template,
             extra_args,
             host_header: self.host_header,
             clear_lead_segments: self.clear_lead_segments,
+            dash_cenc,
             max_response_bytes: self.max_response_bytes,
         })
     }

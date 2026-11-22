@@ -143,19 +143,24 @@ impl ServedAsset {
 
     /// `rendition` names which video rendition a `video-{id}` URL asked for; `None` for a plain
     /// asset's `video`, and for the shared `audio-{n}` group, which is never rendition-scoped.
-    pub(crate) fn init_segment(&self, rendition: Option<&str>, key: TrackKey) -> Result<Bytes> {
+    pub(crate) fn init_segment(
+        &self,
+        rendition: Option<&str>,
+        key: TrackKey,
+        delivery: crate::cenc::Delivery,
+    ) -> Result<Bytes> {
         match self {
             Self::Single(asset) => {
                 if rendition.is_some() {
                     return Err(Error::NotFound("track does not exist"));
                 }
-                asset.init_segment(key)
+                asset.init_segment(key, delivery)
             }
             Self::Composite(asset) => {
                 // The track is asked for under the key it has inside the asset that holds it,
                 // which differs from the external `audio-{n}` for all but the first audio rendition.
                 let (source, key) = asset.resolve(rendition, key)?;
-                source.init_segment(key)
+                source.init_segment(key, delivery)
             }
             Self::Sequence(_) | Self::AdaptiveSequence(_) => {
                 Err(Error::NotFound("a sequence's init segments are per clip"))
@@ -170,10 +175,15 @@ impl ServedAsset {
         rendition: Option<&str>,
         key: TrackKey,
         clip: usize,
+        delivery: crate::cenc::Delivery,
     ) -> Result<Bytes> {
         match self {
-            Self::Sequence(asset) if rendition.is_none() => asset.clip_init_segment(key, clip),
-            Self::AdaptiveSequence(asset) => asset.clip_init_segment(rendition, key, clip),
+            Self::Sequence(asset) if rendition.is_none() => {
+                asset.clip_init_segment(key, clip, delivery)
+            }
+            Self::AdaptiveSequence(asset) => {
+                asset.clip_init_segment(rendition, key, clip, delivery)
+            }
             _ => Err(Error::NotFound("track does not exist")),
         }
     }
@@ -250,6 +260,7 @@ impl ServedAsset {
         rendition: Option<&str>,
         key: TrackKey,
         segment_index: u32,
+        delivery: crate::cenc::Delivery,
     ) -> Result<(Arc<PackagedAsset>, fmp4::PreparedSegment)> {
         match self {
             Self::Single(asset) => {
@@ -258,21 +269,23 @@ impl ServedAsset {
                 }
                 Ok((
                     Arc::clone(asset),
-                    asset.prepare_media_segment(key, segment_index)?,
+                    asset.prepare_media_segment(key, segment_index, delivery)?,
                 ))
             }
             Self::Composite(asset) => {
                 let (source, key) = asset.resolve(rendition, key)?;
-                let prepared = source.prepare_media_segment(key, segment_index)?;
+                let prepared = source.prepare_media_segment(key, segment_index, delivery)?;
                 Ok((source, prepared))
             }
             Self::Sequence(asset) => {
                 if rendition.is_some() {
                     return Err(Error::NotFound("track does not exist"));
                 }
-                asset.prepare_segment(key, segment_index)
+                asset.prepare_segment(key, segment_index, delivery)
             }
-            Self::AdaptiveSequence(asset) => asset.prepare_segment(rendition, key, segment_index),
+            Self::AdaptiveSequence(asset) => {
+                asset.prepare_segment(rendition, key, segment_index, delivery)
+            }
         }
     }
 

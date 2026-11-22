@@ -105,8 +105,12 @@ fn hls_attributes(system: &DrmSystem, key_id: Option<&[u8; 16]>) -> Option<Strin
 
 /// The `ContentProtection` elements of one adaptation set, indented for its children.
 pub(crate) fn dash_content_protection(encryption: &Encryption, key: &ContentKey) -> String {
+    let scheme = match encryption.dash_scheme {
+        super::Scheme::Cbcs => "cbcs",
+        super::Scheme::Cenc => "cenc",
+    };
     let mut xml = format!(
-        "      <ContentProtection schemeIdUri=\"urn:mpeg:dash:mp4protection:2011\" value=\"cbcs\" cenc:default_KID=\"{}\" />\n",
+        "      <ContentProtection schemeIdUri=\"urn:mpeg:dash:mp4protection:2011\" value=\"{scheme}\" cenc:default_KID=\"{}\" />\n",
         uuid_string(&key.key_id)
     );
     for system in &encryption.systems {
@@ -277,5 +281,17 @@ mod tests {
             )),
             "{xml}"
         );
+    }
+
+    #[test]
+    fn dash_names_cenc_when_the_asset_asks_for_it() {
+        let mut encryption = encryption();
+        encryption.dash_scheme = crate::cenc::Scheme::Cenc;
+        let key = encryption.key_for(crate::media::TrackKind::Video);
+
+        let xml = dash_content_protection(&encryption, key);
+
+        assert!(xml.contains(r#"value="cenc" cenc:default_KID="#), "{xml}");
+        assert!(!xml.contains(r#"value="cbcs""#), "{xml}");
     }
 }

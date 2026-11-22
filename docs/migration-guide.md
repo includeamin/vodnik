@@ -18,7 +18,7 @@ Go through your `nginx.conf` and a sample of mapping responses, and mark which o
 | Language and label of audio sequences, `tracks` | Translated |
 | Subtitles (`.vtt`, `.srt`, `.ttml`, `.dfxp` sequences) | Translated; see [supported input](supported-input.md) for the formats |
 | `vod_drm_upstream_location` with AES-CBC / `cbcs` | The DRM bridge: [TDD 0018](technical-design/0018-drm-bridge.md) |
-| `vod_drm_upstream_location` with AES-CTR / `cenc` | **Not supported.** Check which devices need it before you go on |
+| `vod_drm_upstream_location` with AES-CTR / `cenc` | `dash_scheme = "cenc"`: DASH as AES-CTR, HLS as `cbcs`; [TDD 0021](technical-design/0021-cenc-for-dash.md). A change of key part way through an asset is not covered |
 | HLS AES-128 | Native: [TDD 0012](technical-design/0012-hls-aes-128.md) |
 | `vod_fallback_upstream_location` | `[fallback]`: [TDD 0020](technical-design/0020-fallback-on-miss.md) |
 | Live or simulated live (`playlistType` other than `vod`) | **Not supported** |
@@ -91,7 +91,7 @@ Players keep their entry URL, and every URL inside a manifest is made by vodnik 
 - **Segment URLs differ.** Anything that pattern-matches nginx's `seg-1-v1-a1.ts` or `fragment-1-f1-v1-a1.m4s` (a CDN rule, a log parser, a token scheme) needs changing. The CDN's cache rules should key on the full path.
 - **Durations are exact and boundaries are on key frames.** Segment counts and lengths can differ from nginx's for the same file.
 - **Query strings** are passed to the mapping service and carried on the URLs vodnik makes; the asset's content version is in the URL as `?v=`.
-- **Encryption** is `cbcs` only. If a device needs `cenc`, it cannot move yet.
+- **Encryption** is `cbcs` for HLS. For DASH, `dash_scheme = "cenc"` gives AES-CTR as nginx-vod-module does; it was verified against FFmpeg, not a real device, so test your DASH players with it.
 
 ## 4. Test before traffic
 
