@@ -64,7 +64,7 @@ These change what vodnik is, so each starts with a new TDD.
 | Step | Status | Notes |
 | --- | --- | --- |
 | Simulated live from VOD files | New TDD | A live playlist, a sliding window, and a wall-clock timeline over the clip sequences that already exist. [TDD 0008](technical-design/0008-clipping-and-concatenation.md) defers it explicitly |
-| Fallback on file not found | New TDD | nginx-vod-module retries another datacenter on a miss. In vodnik this is a mapper concern (a second location) or an origin failover list |
+| Fallback on file not found | [TDD 0020](technical-design/0020-fallback-on-miss.md), implemented | nginx-vod-module retries another datacenter on a miss. `[fallback]` proxies the same URL to a configured server when an asset or its media file is missing, with a loop guard header |
 | Ad markers (`EXT-X-DATERANGE`, DASH events) | New TDD | Deferred by [TDD 0008](technical-design/0008-clipping-and-concatenation.md), together with linear channels |
 | Microsoft Smooth Streaming (MSS) | Decide first | A third manifest and fragment layout, plus PlayReady for MSS. Only worth it for a known Xbox or legacy smart-TV audience |
 | Adobe HDS | Not recommended | Requires Flash, which no current player supports |

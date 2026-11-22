@@ -18,8 +18,8 @@ use crate::config::{
 };
 use crate::http::{AppState, router, spawn_resolver_probe};
 use crate::testutil::{
-    Answer, MockMapper, MockOrigin, OriginValidator, file_location, fixture, fixtures_dir,
-    http_location, tfdt,
+    Answer, MockFallback, MockMapper, MockOrigin, OriginValidator, file_location, fixture,
+    fixtures_dir, http_location, tfdt,
 };
 
 fn mapper_settings(url: &str) -> MapperConfig {
@@ -7730,4 +7730,211 @@ async fn without_url_compatibility_such_a_url_is_not_found() {
         StatusCode::NOT_FOUND
     );
     assert_eq!(mapping_paths(&h), Vec::<String>::new());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Fallback on a miss (TDD 0020)
+// ---------------------------------------------------------------------------------------------
+
+async fn fallback_harness(fallback: &MockFallback, on_missing_file: bool) -> Harness {
+    let base_url = reqwest::Url::parse(&fallback.url()).unwrap();
+    harness_with(move |config| {
+        config.fallback = Some(crate::config::FallbackSettings {
+            base_url,
+            on_missing_file,
+            timeout_ms: 2000,
+            loop_header: "x-vod-fallback".to_owned(),
+        });
+    })
+    .await
+}
+
+async fn fetch_with(
+    app: &Router,
+    uri: &str,
+    headers: &[(&str, &str)],
+) -> (StatusCode, HeaderMap, Bytes) {
+    let mut request = Request::get(uri);
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let response = app
+        .clone()
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let (parts, body) = response.into_parts();
+    (
+        parts.status,
+        parts.headers,
+        to_bytes(body, usize::MAX).await.unwrap_or_default(),
+    )
+}
+
+#[tokio::test]
+async fn an_unknown_asset_is_answered_by_the_fallback_with_the_same_url() {
+    let fallback = MockFallback::start().await;
+    let h = fallback_harness(&fallback, true).await;
+    let (code, headers, body) = fetch_with(
+        &h.app,
+        "/hls/ghost/master.m3u8?token=abc",
+        &[("range", "bytes=0-9"), ("x-request-id", "req-1")],
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(text(&body), "from the fallback");
+    assert_eq!(headers.get("x-from").unwrap(), "fallback");
+
+    let seen = fallback.requests();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].0, "/hls/ghost/master.m3u8?token=abc");
+    assert_eq!(seen[0].1.get("range").unwrap(), "bytes=0-9");
+    assert_eq!(seen[0].1.get("x-vod-fallback").unwrap(), "1");
+    assert_ne!(seen[0].1.get("host").unwrap(), "localhost");
+}
+
+#[tokio::test]
+async fn what_the_fallback_answers_is_passed_on_as_it_is() {
+    let fallback = MockFallback::start().await;
+    let h = fallback_harness(&fallback, true).await;
+    fallback.state.status.store(404, Ordering::SeqCst);
+    assert_eq!(
+        status(&h.app, "/hls/ghost/master.m3u8").await,
+        StatusCode::NOT_FOUND
+    );
+    fallback.state.status.store(302, Ordering::SeqCst);
+    *fallback.state.location.lock().unwrap() = Some("https://other.example/x".to_owned());
+    let (code, headers, _) = fetch(&h.app, "/dash/ghost/manifest.mpd").await;
+    assert_eq!(code, StatusCode::FOUND);
+    assert_eq!(headers.get("location").unwrap(), "https://other.example/x");
+}
+
+#[tokio::test]
+async fn a_request_that_already_came_through_a_fallback_is_not_passed_on_again() {
+    let fallback = MockFallback::start().await;
+    let h = fallback_harness(&fallback, true).await;
+    let (code, _, _) =
+        fetch_with(&h.app, "/hls/ghost/master.m3u8", &[("x-vod-fallback", "1")]).await;
+    assert_eq!(code, StatusCode::NOT_FOUND);
+    assert_eq!(fallback.requests().len(), 0);
+}
+
+#[tokio::test]
+async fn a_found_asset_never_reaches_the_fallback() {
+    let fallback = MockFallback::start().await;
+    let h = fallback_harness(&fallback, true).await;
+    h.mapper
+        .state
+        .set("movie", Answer::file("v1", "h264-aac.mp4"));
+    assert_eq!(
+        status(&h.app, "/hls/movie/master.m3u8").await,
+        StatusCode::OK
+    );
+    // A track the asset does not have is that asset's own 404, not a missing asset.
+    assert_eq!(
+        status(&h.app, "/hls/movie/audio-9/index.m3u8").await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(fallback.requests().len(), 0);
+}
+
+#[tokio::test]
+async fn an_unreachable_fallback_leaves_the_original_answer() {
+    let fallback = MockFallback::start().await;
+    let h = fallback_harness(&fallback, true).await;
+    // Nothing listens at this address any more once the mock's port is closed, so point at one
+    // that was never opened.
+    let mut config = config_for(&h.mapper, |_| {});
+    config.fallback = Some(crate::config::FallbackSettings {
+        base_url: reqwest::Url::parse("http://127.0.0.1:1").unwrap(),
+        on_missing_file: true,
+        timeout_ms: 500,
+        loop_header: "x-vod-fallback".to_owned(),
+    });
+    let app = router(AppState::new(&config).unwrap());
+    assert_eq!(
+        status(&app, "/hls/ghost/master.m3u8").await,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn a_missing_media_file_goes_to_the_fallback_unless_that_is_turned_off() {
+    let fallback = MockFallback::start().await;
+    let h = fallback_harness(&fallback, true).await;
+    h.mapper
+        .state
+        .set("gone", Answer::file("v1", "no-such-file.mp4"));
+    let (code, _, body) = fetch(&h.app, "/hls/gone/master.m3u8").await;
+    assert_eq!(
+        (code, text(&body).as_str()),
+        (StatusCode::OK, "from the fallback")
+    );
+
+    // An origin that says 404 is a missing file too.
+    let origin = MockOrigin::start().await;
+    h.mapper
+        .state
+        .set("remote-gone", Answer::http("v1", &origin.url("absent.mp4")));
+    let (code, _, _) = fetch(&h.app, "/hls/remote-gone/master.m3u8").await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(fallback.requests().len(), 2);
+
+    let strict_fallback = MockFallback::start().await;
+    let strict = fallback_harness(&strict_fallback, false).await;
+    strict
+        .mapper
+        .state
+        .set("gone", Answer::file("v1", "no-such-file.mp4"));
+    assert_eq!(
+        status(&strict.app, "/hls/gone/master.m3u8").await,
+        StatusCode::BAD_GATEWAY
+    );
+    assert_eq!(strict_fallback.requests().len(), 0);
+    // An unknown asset still goes.
+    assert_eq!(
+        status(&strict.app, "/hls/ghost/master.m3u8").await,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn without_a_fallback_a_miss_is_answered_here() {
+    let h = harness().await;
+    assert_eq!(
+        status(&h.app, "/hls/ghost/master.m3u8").await,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn the_fallback_is_asked_for_the_url_the_viewer_used_under_url_compatibility() {
+    let fallback = MockFallback::start().await;
+    let base_url = reqwest::Url::parse(&fallback.url()).unwrap();
+    let h = harness_with(move |config| {
+        let ResolverSettings::Http(mapper) = &mut config.resolver else {
+            panic!("the harness uses the http resolver");
+        };
+        mapper.dialect = crate::config::Dialect::VodModule;
+        mapper.vod_module.path_template = "vod/{id}".to_owned();
+        mapper.vod_module.file_root = Some("/data/media".to_owned());
+        mapper.vod_module.compat_ids = true;
+        config.url_compat = Some(crate::config::UrlCompatSettings {
+            path_prefix: "/vod".to_owned(),
+        });
+        config.fallback = Some(crate::config::FallbackSettings {
+            base_url,
+            on_missing_file: true,
+            timeout_ms: 2000,
+            loop_header: "x-vod-fallback".to_owned(),
+        });
+    })
+    .await;
+    // The mock mapper has no such mapping: a miss.
+    let (code, _, _) = fetch(&h.app, "/vod/hls/2020/05/missing.mp4/master.m3u8?a=1").await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(
+        fallback.requests()[0].0,
+        "/vod/hls/2020/05/missing.mp4/master.m3u8?a=1"
+    );
 }

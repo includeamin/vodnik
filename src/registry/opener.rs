@@ -92,10 +92,14 @@ impl LocationRefresher for NoRefresh {
 /// Joins `path` to the media root, resolves symlinks, and requires a regular file that is still
 /// beneath the root, so no location can escape it.
 fn confine(root: &Path, path: &Path) -> Result<PathBuf> {
-    let resolved = root
-        .join(path)
-        .canonicalize()
-        .map_err(|error| Error::Upstream(format!("location cannot be opened: {error}")))?;
+    let resolved = root.join(path).canonicalize().map_err(|error| {
+        let message = format!("location cannot be opened: {error}");
+        if error.kind() == std::io::ErrorKind::NotFound {
+            Error::SourceMissing(message)
+        } else {
+            Error::Upstream(message)
+        }
+    })?;
     if !resolved.starts_with(root) || !resolved.is_file() {
         return Err(Error::Upstream(
             "location does not resolve to a file beneath storage.media_root".to_owned(),

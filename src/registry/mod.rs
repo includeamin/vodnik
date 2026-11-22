@@ -54,6 +54,8 @@ pub(crate) enum RegistryError {
     Unavailable(String),
     /// The mapper or media origin misbehaved or was refused: `502`.
     BadUpstream(String),
+    /// The mapper named a media file that is not there: `502`, and `[fallback]` may take it.
+    SourceMissing(String),
     /// The media exists but could not be loaded, for example unsupported codecs: `500`.
     LoadFailed(String),
 }
@@ -1101,6 +1103,7 @@ fn map_load_error(error: Error) -> RegistryError {
         Error::Upstream(message) | Error::LocationRejected(message) => {
             RegistryError::BadUpstream(message)
         }
+        Error::SourceMissing(message) => RegistryError::SourceMissing(message),
         other => RegistryError::LoadFailed(other.to_string()),
     }
 }
@@ -1110,6 +1113,7 @@ fn describe(error: &RegistryError) -> String {
         RegistryError::NotFound => "not found".to_owned(),
         RegistryError::Unavailable(message)
         | RegistryError::BadUpstream(message)
+        | RegistryError::SourceMissing(message)
         | RegistryError::LoadFailed(message) => message.clone(),
     }
 }

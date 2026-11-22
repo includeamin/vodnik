@@ -9,6 +9,7 @@ use crate::error::{Error, Result};
 
 mod authorization;
 mod cors;
+mod fallback;
 mod limits;
 mod logging;
 mod resolver;
@@ -19,6 +20,7 @@ pub(crate) use authorization::AuthorizationSettings;
 #[cfg(test)]
 pub(crate) use authorization::Transports;
 pub(crate) use cors::CorsConfig;
+pub(crate) use fallback::FallbackSettings;
 pub(crate) use limits::LimitsConfig;
 pub(crate) use logging::{LogFormat, LoggingConfig};
 pub(crate) use resolver::{
@@ -40,6 +42,8 @@ pub(crate) struct Config {
     pub(crate) cors: CorsConfig,
     /// Accept the entry URLs of an nginx-vod-module deployment (TDD 0019); `None` does not.
     pub(crate) url_compat: Option<UrlCompatSettings>,
+    /// Pass a miss on to another server (TDD 0020); `None` answers it here.
+    pub(crate) fallback: Option<FallbackSettings>,
     pub(crate) segment_duration_ms: u64,
     /// Signed playback tokens (TDD 0007); `None` checks nothing.
     pub(crate) authorization: Option<AuthorizationSettings>,
@@ -86,6 +90,7 @@ impl Config {
             tls: None,
             cors: CorsConfig::default(),
             url_compat: None,
+            fallback: None,
             segment_duration_ms,
             authorization: None,
             hls_mux_audio: default_hls_mux_audio(),
@@ -198,6 +203,7 @@ impl Config {
             }
         };
         let url_compat = raw.url_compat.validate()?;
+        let fallback = raw.fallback.validate()?;
         let resolver = apply_url_compat(resolver, url_compat.as_ref())?;
 
         Ok(Self {
@@ -207,6 +213,7 @@ impl Config {
             tls,
             cors: raw.cors,
             url_compat,
+            fallback,
             segment_duration_ms: raw.packaging.segment_duration_ms,
             authorization,
             hls_mux_audio: raw.packaging.hls_mux_audio,
@@ -277,6 +284,8 @@ struct RawConfig {
     cors: CorsConfig,
     #[serde(default)]
     url_compat: url_compat::RawUrlCompat,
+    #[serde(default)]
+    fallback: fallback::RawFallback,
     #[serde(default)]
     resolver: resolver::RawResolver,
     #[serde(default)]
@@ -1010,5 +1019,53 @@ mod tests {
         parse_with("[remote_media]\nallowed_hosts = [\"https://origin.example.net/path\"]")
             .expect_err("hosts must be bare");
         parse_with("[remote_media]\nmax_inflight_reads = 0").expect_err("limits must be positive");
+    }
+
+    #[test]
+    fn a_fallback_is_opt_in_with_nginx_like_defaults() {
+        assert!(parse_with("").unwrap().fallback.is_none());
+        assert!(
+            parse_with("[fallback]\nenabled = false")
+                .unwrap()
+                .fallback
+                .is_none()
+        );
+        let on = parse_with("[fallback]\nenabled = true\nbase_url = \"https://dc2.example.net/\"")
+            .unwrap()
+            .fallback
+            .unwrap();
+        assert_eq!(on.base_url.as_str(), "https://dc2.example.net/");
+        assert!(on.on_missing_file);
+        assert_eq!(on.timeout_ms, 5000);
+        assert_eq!(on.loop_header, "x-vod-fallback");
+        let custom = parse_with(
+            "[fallback]\nenabled = true\nbase_url = \"http://dc2:8080/vod\"\non_missing_file = false\nloop_header = \"X-Kaltura-Proxy\"",
+        )
+        .unwrap()
+        .fallback
+        .unwrap();
+        assert!(!custom.on_missing_file);
+        assert_eq!(custom.loop_header, "x-kaltura-proxy");
+    }
+
+    #[test]
+    fn a_fallback_needs_a_plain_http_url_and_sane_settings() {
+        for bad in [
+            "",
+            "dc2.example.net",
+            "ftp://dc2.example.net",
+            "https://dc2.example.net/?a=b",
+            "https://user:pw@dc2.example.net",
+        ] {
+            parse_with(&format!("[fallback]\nenabled = true\nbase_url = \"{bad}\""))
+                .expect_err(bad);
+        }
+        let valid = "enabled = true\nbase_url = \"https://dc2.example.net\"";
+        parse_with(&format!("[fallback]\n{valid}\ntimeout_ms = 0")).expect_err("zero timeout");
+        parse_with(&format!(
+            "[fallback]\n{valid}\nloop_header = \"not a header\""
+        ))
+        .expect_err("bad header name");
+        parse_with(&format!("[fallback]\n{valid}\nunknown = 1")).expect_err("unknown key");
     }
 }

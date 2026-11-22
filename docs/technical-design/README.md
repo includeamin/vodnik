@@ -23,6 +23,7 @@ Technical design documents explain a proposed subsystem before or during impleme
 | [0015](0015-vod-module-mapping-adapter.md) | nginx-vod-module mapping adapter | Accepted; stage 1 implemented (`tracks`, rendition language, label and default) |
 | [0016](0016-adaptive-clips.md) | Adaptive clips | Accepted; stage 1 implemented (clear content) |
 | [0019](0019-url-compatibility.md) | URL compatibility for nginx-vod-module entry URLs | Accepted; implemented for single-file URIs |
+| [0020](0020-fallback-on-miss.md) | Fallback on a miss: pass the request to another server | Accepted; implemented |
 | [0018](0018-drm-bridge.md) | DRM bridge for nginx-vod-module deployments | Accepted; implemented for `cbcs` |
 | [0017](0017-verification-harness.md) | Verification harness | Accepted; stages 1 and 2 implemented (mapper-driven conformance, browser suite) |
 
