@@ -613,15 +613,15 @@ impl HttpResolver {
                             entry.id
                         ));
                     }
-                    RenditionSource::Clips(self.interpret_clips(&entry.clips).map_err(|error| {
-                        match error {
+                    RenditionSource::Clips(self.interpret_clips(&entry.clips, true).map_err(
+                        |error| match error {
                             ResolveError::Rejected(message) => ResolveError::Rejected(format!(
                                 "rendition `{}`: {message}",
                                 entry.id
                             )),
                             other => other,
-                        }
-                    })?)
+                        },
+                    )?)
                 }
                 _ => {
                     return reject(format!(
@@ -740,7 +740,11 @@ impl HttpResolver {
 
     /// A sequence of clips instead of one `location`. Windows are checked here; whether a window
     /// holds any media waits until its file is parsed (`clip::trim`).
-    fn interpret_clips(&self, wire: &[WireClip]) -> Result<Vec<ClipLocation>, ResolveError> {
+    fn interpret_clips(
+        &self,
+        wire: &[WireClip],
+        allow_periods: bool,
+    ) -> Result<Vec<ClipLocation>, ResolveError> {
         if wire.len() > self.max_clips {
             return Err(ResolveError::Rejected(format!(
                 "mapper listed {} clips, more than limits.max_clips ({})",
@@ -768,9 +772,13 @@ impl HttpResolver {
                         from_ms,
                         to_ms: clip.to_ms,
                     },
-                    encryption: Self::interpret_clip_encryption(clip.encryption.as_ref()).map_err(
-                        |message| ResolveError::Rejected(format!("clip {position}: {message}")),
-                    )?,
+                    encryption: Self::interpret_clip_encryption(
+                        clip.encryption.as_ref(),
+                        allow_periods,
+                    )
+                    .map_err(|message| {
+                        ResolveError::Rejected(format!("clip {position}: {message}"))
+                    })?,
                     tracks: clip
                         .tracks
                         .as_deref()
@@ -792,19 +800,24 @@ impl HttpResolver {
             .transpose()
     }
 
-    /// A clip's own `encryption`: a single key set, never a timeline (TDD 0013).
+    /// A clip's own `encryption`. Key periods rotate the key inside the clip, on the clip's own
+    /// timeline, and are served only for the clips of a rendition (TDD 0016, stage 3); the clips
+    /// of a plain sequence take a single key set.
     fn interpret_clip_encryption(
         wire: Option<&crate::cenc::WireEncryption>,
+        allow_periods: bool,
     ) -> Result<Option<Arc<crate::cenc::Encryption>>, String> {
         let encryption = Self::interpret_encryption(wire)?;
-        if encryption.as_ref().is_some_and(|e| e.is_rotating()) {
+        if !allow_periods && encryption.as_ref().is_some_and(|e| e.is_rotating()) {
             return Err("a clip's encryption cannot have periods".to_owned());
         }
         Ok(encryption)
     }
 
-    /// What stage 1 of TDD 0016 does not serve with renditions that have clips: encryption of any
-    /// kind, and subtitles. Each is refused with a message that points to the design.
+    /// What TDD 0016 does not serve with renditions that have clips: subtitles and encrypted
+    /// sources. Each is refused with a message that points to the design. A clip's own
+    /// `encryption` is served only when every rendition gives that clip the same one, so a player
+    /// switching renditions never finds one clip under two keys.
     fn refuse_unsupported_with_rendition_clips(
         wire: &Wire,
         renditions: &[RenditionLocation],
@@ -826,20 +839,31 @@ impl HttpResolver {
         if wire.source_encryption.is_some() {
             return refuse("source_encryption");
         }
-        let encrypted_clip = renditions
+        Self::check_clip_encryption_agrees(renditions)?;
+        Ok(())
+    }
+
+    /// Every rendition gives clip `k` the same encryption, or none (TDD 0016, stage 3).
+    fn check_clip_encryption_agrees(renditions: &[RenditionLocation]) -> Result<(), ResolveError> {
+        let clips = renditions
             .iter()
-            .find_map(|rendition| match &rendition.source {
-                RenditionSource::Clips(clips) => clips
-                    .iter()
-                    .position(|clip| clip.encryption.is_some())
-                    .map(|position| (rendition.id.as_str(), position)),
+            .filter_map(|rendition| match &rendition.source {
+                RenditionSource::Clips(clips) => Some((rendition.id.as_str(), clips)),
                 RenditionSource::Location(_) => None,
             });
-        if let Some((id, position)) = encrypted_clip {
-            return Err(ResolveError::Rejected(format!(
-                "rendition `{id}`: clip {position}: encryption is not supported yet with \
-                 renditions that have clips (TDD 0016)"
-            )));
+        let mut clips = clips.peekable();
+        let Some(&(first_id, first)) = clips.peek() else {
+            return Ok(());
+        };
+        for (id, other) in clips {
+            for (position, (a, b)) in first.iter().zip(other).enumerate() {
+                if a.encryption != b.encryption {
+                    return Err(ResolveError::Rejected(format!(
+                        "clip {position}: renditions `{first_id}` and `{id}` are not encrypted \
+                         the same way (TDD 0016)"
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -896,7 +920,7 @@ impl HttpResolver {
             .map(|location| self.interpret_location(location))
             .transpose()?;
         let renditions = self.interpret_renditions(&wire.renditions)?;
-        let clips = self.interpret_clips(&wire.clips)?;
+        let clips = self.interpret_clips(&wire.clips, false)?;
         if !clips.is_empty() && !wire.subtitles.is_empty() {
             // A clip starts on a keyframe, so the mapper cannot know where the served timeline
             // begins; cues written for it would drift by up to a GOP (TDD 0008, "Deferred").
@@ -939,7 +963,11 @@ impl HttpResolver {
                     "hls_aes128 and encryption cannot both be set".to_owned(),
                 ));
             }
-            if clips.iter().any(|clip| clip.encryption.is_some()) {
+            let rendition_clip_encryption = renditions.iter().any(|rendition| {
+                matches!(&rendition.source, RenditionSource::Clips(clips)
+                    if clips.iter().any(|clip| clip.encryption.is_some()))
+            });
+            if rendition_clip_encryption || clips.iter().any(|clip| clip.encryption.is_some()) {
                 return Err(ResolveError::Rejected(
                     "hls_aes128 and a clip's encryption cannot both be set".to_owned(),
                 ));
@@ -1216,20 +1244,8 @@ mod tests {
     }
 
     #[test]
-    fn stage_three_features_are_still_refused_with_rendition_clips() {
+    fn what_stage_three_does_not_serve_is_still_refused_with_rendition_clips() {
         let base = || answer(&[clips_rendition("a", &["x.mp4"])]);
-        let encryption = json!({
-            "scheme": "cbcs",
-            "keys": [{ "key_id": KEY_ID, "key": KEY }],
-            "systems": [{ "system_id": "e2719d58-a985-b3c9-781a-b030af78d30e", "license_url": "https://l.example.net/ck" }],
-        });
-        // Whole-asset `encryption` and `hls_aes128` are accepted (stage 2).
-        let mut whole = base();
-        whole["encryption"] = encryption.clone();
-        assert!(interpret(&resolver(64, 256), &whole).is_ok());
-        let mut aes128 = base();
-        aes128["hls_aes128"] = json!({ "key": KEY, "key_uri": "https://keys.example.com/k" });
-        assert!(interpret(&resolver(64, 256), &aes128).is_ok());
         let mut cases = Vec::new();
         let mut source = base();
         source["source_encryption"] = json!({ "keys": [{ "key_id": KEY_ID, "key": KEY }] });
@@ -1241,14 +1257,84 @@ mod tests {
             "location": { "type": "file", "path": "s.vtt" },
         }]);
         cases.push(("subtitles", subtitles));
-        let mut clip_encryption = base();
-        clip_encryption["renditions"][0]["clips"][0]["encryption"] = encryption;
-        cases.push(("a clip's encryption", clip_encryption));
-
+        let mut periods = base();
+        periods["encryption"] = json!({
+            "scheme": "cbcs",
+            "periods": [
+                { "start_ms": 0, "clear": true },
+                { "start_ms": 1000, "keys": [{ "key_id": KEY_ID, "key": KEY }],
+                  "systems": [{ "system_id": "e2719d58-a985-b3c9-781a-b030af78d30e", "license_url": "https://l.example.net/ck" }] },
+            ],
+        });
+        cases.push(("answer-level key periods", periods));
         for (name, answer) in cases {
             let message = rejected(interpret(&resolver(64, 256), &answer));
-            assert!(message.contains("TDD 0016"), "{name}: {message}");
+            assert!(
+                message.contains("TDD 0016") || message.contains("periods"),
+                "{name}: {message}"
+            );
         }
+    }
+
+    #[test]
+    fn a_clips_own_encryption_is_accepted_when_every_rendition_agrees() {
+        let mut both = answer(&[
+            clips_rendition("a", &["x.mp4"]),
+            clips_rendition("b", &["y.mp4"]),
+        ]);
+        let encryption = json!({
+            "scheme": "cbcs",
+            "keys": [{ "key_id": KEY_ID, "key": KEY }],
+            "systems": [{ "system_id": "e2719d58-a985-b3c9-781a-b030af78d30e", "license_url": "https://l.example.net/ck" }],
+        });
+        for rendition in 0..2 {
+            both["renditions"][rendition]["clips"][0]["encryption"] = encryption.clone();
+        }
+        assert!(interpret(&resolver(64, 256), &both).is_ok());
+        // One rendition clear while the other is encrypted would give a player two answers.
+        let mut apart = both.clone();
+        apart["renditions"][1]["clips"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("encryption");
+        let message = rejected(interpret(&resolver(64, 256), &apart));
+        assert!(
+            message.contains("clip 0") && message.contains("`a`") && message.contains("`b`"),
+            "{message}"
+        );
+        assert!(!message.contains(KEY));
+        // A clip's own periods rotate the key inside that clip, on the clip's own timeline.
+        let mut rotating = both.clone();
+        rotating["renditions"][0]["clips"][0]["encryption"] = json!({
+            "scheme": "cbcs",
+            "periods": [
+                { "start_ms": 0, "clear": true },
+                { "start_ms": 1000, "keys": [{ "key_id": KEY_ID, "key": KEY }],
+                  "systems": [{ "system_id": "e2719d58-a985-b3c9-781a-b030af78d30e", "license_url": "https://l.example.net/ck" }] },
+            ],
+        });
+        assert!(
+            interpret(&resolver(64, 256), &rotating).is_err(),
+            "a rendition that differs"
+        );
+        for rendition in 0..2 {
+            rotating["renditions"][rendition]["clips"][0]["encryption"] =
+                rotating["renditions"][0]["clips"][0]["encryption"].clone();
+        }
+        assert!(interpret(&resolver(64, 256), &rotating).is_ok());
+        // Plain clips keep refusing them.
+        let mut plain = json!({"asset_id": "movie", "version": "v1", "clips": [
+            {"location": {"type": "file", "path": "x.mp4"},
+             "encryption": rotating["renditions"][0]["clips"][0]["encryption"].clone()}]});
+        assert!(rejected(interpret(&resolver(64, 256), &plain)).contains("periods"));
+        plain["clips"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("encryption");
+        // Whole-segment AES-128 and a clip's own keys do not mix.
+        let mut aes = both.clone();
+        aes["hls_aes128"] = json!({ "key": KEY, "key_uri": "https://keys.example.com/k" });
+        assert!(rejected(interpret(&resolver(64, 256), &aes)).contains("hls_aes128"));
     }
 
     #[test]
