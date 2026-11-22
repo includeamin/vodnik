@@ -327,7 +327,10 @@ fn write_segment_entries(
             .ok()
             .and_then(|offset| offset.checked_add(u64::from(first_number)))
             .ok_or_else(|| Error::InvalidMedia("segment number overflow".to_owned()))?;
-        if let Some(period) = periods.next_if(|period| u64::from(period.first_segment) <= number) {
+        // A period's first segment is local to the presentation it belongs to, so it is compared
+        // with the segment's place in that presentation, not its number across a sequence.
+        let place = u64::try_from(offset).unwrap_or(u64::MAX);
+        if let Some(period) = periods.next_if(|period| u64::from(period.first_segment) <= place) {
             playlist.push_str(&match period.encryption {
                 Some(encryption) => crate::cenc::hls_key_lines(
                     encryption,
@@ -373,7 +376,13 @@ pub(crate) fn sequence_media_playlist(
         if position > 0 {
             playlist.push_str("#EXT-X-DISCONTINUITY\n");
         }
-        let encryption = clip.presentation.encryption();
+        // A clip that rotates its key starts in its first period and ends in its last; the key
+        // in force between clips is the one the clip before ended in (TDD 0016, stage 3).
+        let schedule = clip.presentation.key_schedule();
+        let encryption = schedule.first().map_or_else(
+            || clip.presentation.encryption(),
+            |period| period.encryption,
+        );
         if encryption != previous_encryption {
             playlist.push_str(&key_transition_lines(
                 previous_encryption,
@@ -381,8 +390,11 @@ pub(crate) fn sequence_media_playlist(
                 track.kind,
                 "EXT-X-KEY",
             ));
-            previous_encryption = encryption;
         }
+        previous_encryption = schedule.last().map_or_else(
+            || clip.presentation.encryption(),
+            |period| period.encryption,
+        );
         // A key applies to every initialization section declared while it is in force (RFC 8216,
         // 4.3.2.5), and an `AES-128` asset sends its init segments clear. After the first clip the
         // key from the clip before is still in force, so it is switched off for the map and back
@@ -581,6 +593,13 @@ pub(crate) fn adaptive_sequence_master_playlist(
 ) -> Result<String> {
     let variants = variants_by_bandwidth(video)?;
     let mut playlist = String::from("#EXTM3U\n#EXT-X-VERSION:7\n");
+    // Every licence any clip needs, once, so a player can fetch them before it reaches the clip.
+    playlist.push_str(&crate::cenc::hls_session_keys_for_sequence(
+        video
+            .iter()
+            .flat_map(|entry| &entry.clips)
+            .filter_map(|clip| clip.presentation.encryption()),
+    ));
     for (index, member) in audio.iter().enumerate() {
         let tracks = member
             .clips

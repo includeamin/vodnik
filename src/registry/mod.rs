@@ -994,9 +994,11 @@ impl AssetRegistry {
                         .iter()
                         .zip(file_indices)
                         .map(|(clip, &file)| {
-                            // Whole-asset encryption (TDD 0016, stage 2): the answer's keys
-                            // cover every clip of every rendition.
-                            (file, clip.window, encryption.clone(), clip.tracks)
+                            // The clip's own keys, else the answer's, as for a plain sequence
+                            // (TDD 0009, "Different keys per clip"). The interpreter has checked
+                            // that every rendition gives a clip the same ones.
+                            let encryption = clip.encryption.clone().or_else(|| encryption.clone());
+                            (file, clip.window, encryption, clip.tracks)
                         })
                         .collect(),
                 })
