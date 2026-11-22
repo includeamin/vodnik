@@ -22,7 +22,7 @@ pub(crate) use limits::LimitsConfig;
 pub(crate) use logging::{LogFormat, LoggingConfig};
 pub(crate) use resolver::{
     Dialect, MapperConfig, RegistryConfig, RemoteMediaConfig, ResolverSettings, Secret,
-    read_token_file,
+    VodDrmConfig, read_token_file,
 };
 pub(crate) use tls::TlsConfig;
 #[cfg(test)]
@@ -772,6 +772,41 @@ mod tests {
             panic!("expected the http resolver");
         };
         assert_eq!(mapper.vod_module.path_template, "{id}");
+    }
+
+    #[test]
+    fn the_drm_bridge_is_configured_and_checked() {
+        let base = "base_url = \"https://m.example.net\"\ndialect = \"vod-module\"\n[resolver.http.vod_module.drm]\n";
+        let config = mapper_config(&format!(
+            "{base}path_template = \"drm/{{id}}\"\nextra_args = \"?k=1\"\nhost_header = \"keys.example\"\nclear_lead_segments = 2\nmax_response_bytes = 4096"
+        ))
+        .expect("a complete drm section is accepted");
+        let ResolverSettings::Http(mapper) = &config.resolver else {
+            panic!("expected the http resolver");
+        };
+        let drm = mapper.vod_module.drm.as_ref().expect("drm is configured");
+        assert_eq!(drm.path_template, "drm/{id}");
+        assert_eq!(drm.extra_args.as_deref(), Some("k=1"));
+        assert_eq!(drm.clear_lead_segments, 2);
+        assert_eq!(drm.max_response_bytes, 4096);
+        // Without the table there is no key service.
+        let plain = mapper_config("base_url = \"https://m.example.net\"\ndialect = \"vod-module\"")
+            .unwrap();
+        let ResolverSettings::Http(mapper) = &plain.resolver else {
+            panic!("expected the http resolver");
+        };
+        assert!(mapper.vod_module.drm.is_none());
+        for extra in [
+            "path_template = \"drm/none\"",
+            "path_template = \"{id}?x=1\"",
+            "path_template = \"../{id}\"",
+            "extra_args = \"a=1#frag\"",
+            "host_header = \"two words\"",
+            "max_response_bytes = 0",
+            "unknown = 1",
+        ] {
+            mapper_config(&format!("{base}{extra}")).expect_err(extra);
+        }
     }
 
     #[test]

@@ -7366,3 +7366,212 @@ async fn a_rotating_clip_followed_by_a_clear_one_switches_the_key_off() {
         .unwrap();
     assert!(none < second_map, "{playlist}");
 }
+
+// ---------------------------------------------------------------------------------------------
+// The DRM bridge (TDD 0018)
+// ---------------------------------------------------------------------------------------------
+
+const DRM_KEY_B64: &str = "MDEyMzQ1Njc4OWFiY2RlZg=="; // "0123456789abcdef"
+
+fn drm_info(key_id: &[u8; 16]) -> String {
+    use base64::Engine;
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+    serde_json::json!([{
+        "key": DRM_KEY_B64,
+        "key_id": b64(key_id),
+        "pssh": [{"uuid": "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed", "data": b64(b"widevine-data")}],
+    }])
+    .to_string()
+}
+
+const DRM_KEY_ID: [u8; 16] = [
+    0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+];
+
+async fn vod_drm_harness(clear_lead_segments: u32) -> Harness {
+    harness_with(|config| {
+        config.hls_mux_audio = false;
+        let ResolverSettings::Http(mapper) = &mut config.resolver else {
+            panic!("the harness uses the http resolver");
+        };
+        mapper.dialect = crate::config::Dialect::VodModule;
+        mapper.vod_module.path_template = "vod/{id}".to_owned();
+        mapper.vod_module.file_root = Some("/data/media".to_owned());
+        mapper.vod_module.drm = Some(crate::config::VodDrmConfig {
+            path_template: "drm/{id}".to_owned(),
+            clear_lead_segments,
+            ..crate::config::VodDrmConfig::default()
+        });
+    })
+    .await
+}
+
+fn set_mapping(h: &Harness, mapping: &serde_json::Value) {
+    *h.mapper.state.raw_body.lock().unwrap() = Some(mapping.to_string());
+}
+
+fn one_file(cache: bool) -> serde_json::Value {
+    serde_json::json!({"cache": cache, "sequences": [{"clips": [{
+        "type": "source", "path": "/data/media/h264-aac.mp4"}]}]})
+}
+
+#[tokio::test]
+async fn a_vod_module_asset_is_encrypted_with_the_key_the_drm_service_gives() {
+    let h = vod_drm_harness(0).await;
+    set_mapping(&h, &one_file(true));
+    *h.mapper.state.drm_body.lock().unwrap() = Some(drm_info(&DRM_KEY_ID));
+    let master = fetch(&h.app, "/hls/movie/master.m3u8").await;
+    assert_eq!(master.0, StatusCode::OK, "{}", text(&master.2));
+    let version = version_in(&master.2);
+
+    let init = fetch(&h.app, &format!("/hls/movie/video/init.mp4?v={version}"))
+        .await
+        .2;
+    assert!(init.windows(4).any(|w| w == b"encv") && init.windows(4).any(|w| w == b"tenc"));
+    let tenc = init.windows(4).position(|w| w == b"tenc").unwrap();
+    assert_eq!(&init[tenc + 12..tenc + 28], &DRM_KEY_ID);
+    let playlist = text(&fetch(&h.app, "/hls/movie/video/index.m3u8").await.2);
+    assert!(playlist.contains("EXT-X-KEY"), "{playlist}");
+    let manifest = text(&fetch(&h.app, "/dash/movie/manifest.mpd").await.2);
+    assert!(
+        manifest.contains("edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"),
+        "{manifest}"
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&fetch(&h.app, "/admin/status").await.2).unwrap();
+    assert_eq!(
+        json["cache"]["assets"][0]["key_ids"],
+        serde_json::json!(["01234567-89ab-cdef-0123-456789abcdef"])
+    );
+    assert!(
+        !json
+            .to_string()
+            .contains("30313233343536373839616263646566")
+    );
+}
+
+#[tokio::test]
+async fn a_key_the_drm_service_rotates_reaches_an_asset_whose_mapping_did_not_change() {
+    let h = vod_drm_harness(0).await;
+    // `cache: false` gives the shortest reuse window, so the next request asks again.
+    set_mapping(&h, &one_file(false));
+    *h.mapper.state.drm_body.lock().unwrap() = Some(drm_info(&DRM_KEY_ID));
+    let before = version_in(&fetch(&h.app, "/hls/movie/master.m3u8").await.2);
+
+    let mut other = DRM_KEY_ID;
+    other[0] = 0xff;
+    *h.mapper.state.drm_body.lock().unwrap() = Some(drm_info(&other));
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let master = fetch(&h.app, "/hls/movie/master.m3u8").await;
+    assert_eq!(master.0, StatusCode::OK);
+    let after = version_in(&master.2);
+    assert_ne!(before, after, "the new key is a new asset");
+    let init = fetch(&h.app, &format!("/hls/movie/video/init.mp4?v={after}"))
+        .await
+        .2;
+    let tenc = init.windows(4).position(|w| w == b"tenc").unwrap();
+    assert_eq!(&init[tenc + 12..tenc + 28], &other);
+}
+
+#[tokio::test]
+async fn a_clear_lead_is_counted_in_segments() {
+    let h = vod_drm_harness(2).await;
+    set_mapping(&h, &one_file(true));
+    *h.mapper.state.drm_body.lock().unwrap() = Some(drm_info(&DRM_KEY_ID));
+    let playlist = text(&fetch(&h.app, "/hls/movie/video/index.m3u8").await.2);
+    let lines = playlist.lines().collect::<Vec<_>>();
+    let first_key = lines
+        .iter()
+        .position(|line| line.starts_with("#EXT-X-KEY"))
+        .unwrap_or_else(|| panic!("{playlist}"));
+    let segment = |number: u32| {
+        lines
+            .iter()
+            .position(|line| line.contains(&format!("segments/{number}/")))
+            .unwrap()
+    };
+    assert!(
+        segment(1) < first_key && first_key < segment(2),
+        "the first two segments are clear and the third is encrypted\n{playlist}"
+    );
+}
+
+#[tokio::test]
+async fn the_drm_services_failures_are_told_apart() {
+    let h = vod_drm_harness(0).await;
+    set_mapping(&h, &one_file(true));
+    // No key service answer: the asset does not exist for DRM purposes.
+    assert_eq!(
+        status(&h.app, "/hls/gone/master.m3u8").await,
+        StatusCode::BAD_GATEWAY
+    );
+    // A malformed answer is a bad gateway and never cached as valid.
+    *h.mapper.state.drm_body.lock().unwrap() = Some("{}".to_owned());
+    assert_eq!(
+        status(&h.app, "/hls/bad/master.m3u8").await,
+        StatusCode::BAD_GATEWAY
+    );
+    // An outage is retried and then reported as unavailable.
+    h.mapper.state.drm_status.store(503, Ordering::SeqCst);
+    assert_eq!(
+        status(&h.app, "/hls/down/master.m3u8").await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert!(h.mapper.state.drm_calls.load(Ordering::SeqCst) >= 3);
+}
+
+#[tokio::test]
+async fn the_drm_key_covers_every_clip_of_an_adaptive_playlist() {
+    let h = vod_drm_harness(0).await;
+    let sequence = |id: &str, file: &str| {
+        serde_json::json!({"id": id, "clips": [
+            {"type": "source", "path": format!("/data/media/{file}"), "tracks": "v1-a1"},
+            {"type": "source", "path": format!("/data/media/{file}"), "tracks": "v1-a1", "clipFrom": 1000}]})
+    };
+    set_mapping(
+        &h,
+        &serde_json::json!({"durations": [1000, 1000], "sequences": [
+            sequence("720p", "rendition-720p.mp4"),
+            sequence("480p", "rendition-480p.mp4")]}),
+    );
+    *h.mapper.state.drm_body.lock().unwrap() = Some(drm_info(&DRM_KEY_ID));
+    let master = fetch(&h.app, "/hls/grid/master.m3u8").await;
+    assert_eq!(master.0, StatusCode::OK, "{}", text(&master.2));
+    for track in ["video-720p", "video-480p", "audio-1"] {
+        let playlist = text(
+            &fetch(&h.app, &format!("/hls/grid/{track}/index.m3u8"))
+                .await
+                .2,
+        );
+        assert!(playlist.contains("EXT-X-KEY"), "{track}: {playlist}");
+    }
+}
+
+#[tokio::test]
+async fn the_drm_service_is_asked_with_the_mappers_bearer_token() {
+    let h = harness_with(|config| {
+        config.hls_mux_audio = false;
+        let ResolverSettings::Http(mapper) = &mut config.resolver else {
+            panic!("the harness uses the http resolver");
+        };
+        mapper.bearer_token = Some(Secret::new("mapper-token".to_owned()));
+        mapper.dialect = crate::config::Dialect::VodModule;
+        mapper.vod_module.path_template = "vod/{id}".to_owned();
+        mapper.vod_module.file_root = Some("/data/media".to_owned());
+        mapper.vod_module.drm = Some(crate::config::VodDrmConfig {
+            path_template: "drm/{id}".to_owned(),
+            ..crate::config::VodDrmConfig::default()
+        });
+    })
+    .await;
+    set_mapping(&h, &one_file(true));
+    *h.mapper.state.drm_body.lock().unwrap() = Some(drm_info(&DRM_KEY_ID));
+    assert_eq!(
+        status(&h.app, "/hls/movie/master.m3u8").await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        *h.mapper.state.drm_tokens.lock().unwrap(),
+        [Some("Bearer mapper-token".to_owned())]
+    );
+}

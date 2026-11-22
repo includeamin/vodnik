@@ -8,6 +8,7 @@
 mod catalog;
 mod mapper;
 mod policy;
+mod vod_drm;
 mod vod_module;
 
 use std::fmt;

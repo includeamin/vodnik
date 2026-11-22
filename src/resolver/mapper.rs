@@ -10,11 +10,13 @@ use std::time::{Duration, Instant};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CACHE_CONTROL, HOST, IF_NONE_MATCH, RETRY_AFTER};
 use reqwest::{Client, Response, StatusCode, Url};
 use serde::Deserialize;
+use serde_json::Value;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::time::sleep;
 
 use super::policy::{LocationPolicy, validate_relative_path};
+use super::vod_drm;
 use super::vod_module;
 use super::{
     AssetLocation, ClipLocation, RenditionLocation, RenditionSource, Resolution, ResolveError,
@@ -22,7 +24,7 @@ use super::{
 };
 use crate::clip::{ClipWindow, MAX_CLIP_MS};
 use crate::config::Secret;
-use crate::config::{Dialect, MapperConfig, is_valid_asset_id, read_token_file};
+use crate::config::{Dialect, MapperConfig, VodDrmConfig, is_valid_asset_id, read_token_file};
 use crate::media::{AudioOverrides, TrackSelection};
 use crate::observability::request_id;
 
@@ -318,7 +320,10 @@ impl HttpResolver {
         if !response.status().is_success() {
             return None;
         }
-        let body = self.read_body(response).await.ok()?;
+        let body = self
+            .read_body(response, self.settings.max_response_bytes)
+            .await
+            .ok()?;
         let listing: Listing = serde_json::from_slice(&body).ok()?;
         let mut ids = listing
             .assets
@@ -387,11 +392,13 @@ impl HttpResolver {
         match status {
             StatusCode::OK => {
                 let max_age = max_age(&response);
-                let body = self.read_body(response).await?;
+                let body = self
+                    .read_body(response, self.settings.max_response_bytes)
+                    .await?;
                 if self.settings.dialect == Dialect::VodModule {
-                    return Ok(self
-                        .interpret_mapping(asset_id, known_version, &body, max_age)
-                        .await?);
+                    return self
+                        .interpret_mapping(asset_id, known_version, &body, max_age, request_id)
+                        .await;
                 }
                 let wire = parse_answer(&body)?;
                 Ok(Resolution::Resolved(
@@ -438,7 +445,8 @@ impl HttpResolver {
         known_version: Option<&str>,
         body: &[u8],
         max_age_seconds: Option<u64>,
-    ) -> Result<Resolution, ResolveError> {
+        request_id: &str,
+    ) -> Result<Resolution, Failure> {
         let vod_module = &self.settings.vod_module;
         let translated = vod_module::translate(
             body,
@@ -456,6 +464,18 @@ impl HttpResolver {
             ResolveError::Rejected(reason)
         })?;
         let mut answer = translated.answer;
+        if let Some(drm) = &vod_module.drm {
+            // The key service is asked on every revalidation, and what it answers is part of the
+            // version, so a key it rotates reaches an asset whose mapping did not change.
+            let encryption = self.fetch_drm(asset_id, drm, request_id).await?;
+            let version = format!(
+                "{}-{}",
+                answer["version"].as_str().unwrap_or_default(),
+                vod_drm::fingerprint(&encryption)
+            );
+            answer["version"] = version.into();
+            answer["encryption"] = encryption;
+        }
         vod_module::mix_in_file_identity(&mut answer, &self.media_root).await;
         // `"cache": false` asks for the shortest reuse window the configuration allows.
         let explicit_ttl = (!translated.cache).then_some(0);
@@ -476,13 +496,80 @@ impl HttpResolver {
         )?))
     }
 
-    /// Reads the body, failing as soon as it exceeds `max_response_bytes`.
-    async fn read_body(&self, mut response: Response) -> Result<Vec<u8>, ResolveError> {
+    /// Asks the key service for the asset's DRM info and returns it as an `encryption` object
+    /// (TDD 0018). A network error or a server error is retried like a mapping's; an answer that
+    /// cannot be used is a rejected one. No message here carries a key.
+    async fn fetch_drm(
+        &self,
+        asset_id: &str,
+        drm: &VodDrmConfig,
+        request_id: &str,
+    ) -> Result<Value, Failure> {
+        let path = drm.path_template.replace("{id}", &percent_encode(asset_id));
+        let mut url = format!("{}/{}", self.base_url, path.trim_start_matches('/'));
+        if let Some(args) = &drm.extra_args {
+            url.push('?');
+            url.push_str(args);
+        }
+        let mut request = self
+            .authorized(self.client.get(url))
+            .header(ACCEPT, "application/json")
+            .header("x-request-id", request_id);
+        if let Some(host) = &drm.host_header {
+            request = request.header(HOST, host);
+        }
+        let response = request.send().await.map_err(|error| {
+            ResolveError::Unavailable(format!("key service unreachable: {}", error.without_url()))
+        })?;
+        let status = response.status();
+        match status {
+            StatusCode::OK => {
+                let body = self.read_body(response, drm.max_response_bytes).await?;
+                let clear_lead_ms =
+                    u64::from(drm.clear_lead_segments).saturating_mul(self.segment_duration_ms);
+                vod_drm::encryption_from_drm_info(&body, clear_lead_ms).map_err(|reason| {
+                    tracing::warn!(event = "drm_info_rejected", asset.id = asset_id, %reason);
+                    ResolveError::Rejected(reason).into()
+                })
+            }
+            StatusCode::NOT_FOUND | StatusCode::GONE => Err(ResolveError::Rejected(
+                "the key service has no DRM info for this asset".to_owned(),
+            )
+            .into()),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(ResolveError::Rejected(
+                "the key service refused this service's credentials".to_owned(),
+            )
+            .into()),
+            StatusCode::TOO_MANY_REQUESTS => Err(Failure {
+                retry_after: response
+                    .headers()
+                    .get(RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .map(Duration::from_secs),
+                error: ResolveError::Unavailable("the key service is shedding load".to_owned()),
+            }),
+            status if status.is_server_error() => {
+                Err(ResolveError::Unavailable(format!("the key service answered {status}")).into())
+            }
+            status => Err(ResolveError::Rejected(format!(
+                "unexpected key service status {status}"
+            ))
+            .into()),
+        }
+    }
+
+    /// Reads the body, failing as soon as it exceeds `limit` bytes.
+    async fn read_body(
+        &self,
+        mut response: Response,
+        limit: usize,
+    ) -> Result<Vec<u8>, ResolveError> {
         let mut body = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(|error| {
             ResolveError::Unavailable(format!("mapper body failed: {}", error.without_url()))
         })? {
-            if body.len() + chunk.len() > self.settings.max_response_bytes {
+            if body.len() + chunk.len() > limit {
                 return Err(ResolveError::Rejected(
                     "mapper answer exceeds max_response_bytes".to_owned(),
                 ));
