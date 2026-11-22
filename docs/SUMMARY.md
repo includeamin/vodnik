@@ -7,6 +7,7 @@
 - [Architecture](architecture.md)
 - [Roadmap](roadmap.md)
 - [Using vodnik](usage.md)
+- [Migrating from nginx-vod-module](migration-guide.md)
 - [Supported input](supported-input.md)
 - [Deploying](deployment.md)
 - [Operating the origin](operations.md)
@@ -27,6 +28,14 @@
   - [Compact sample index](technical-design/0010-compact-sample-index.md)
   - [Muxed audio and video for HLS](technical-design/0011-muxed-hls-audio.md)
   - [Whole-segment HLS AES-128](technical-design/0012-hls-aes-128.md)
+  - [Key rotation within an asset](technical-design/0013-key-rotation.md)
+  - [Encrypted source files](technical-design/0014-encrypted-source-files.md)
+  - [nginx-vod-module mapping adapter](technical-design/0015-vod-module-mapping-adapter.md)
+  - [Adaptive clips](technical-design/0016-adaptive-clips.md)
+  - [Verification harness](technical-design/0017-verification-harness.md)
+  - [DRM bridge](technical-design/0018-drm-bridge.md)
+  - [URL compatibility](technical-design/0019-url-compatibility.md)
+  - [Fallback on a miss](technical-design/0020-fallback-on-miss.md)
   - [Technical design template](technical-design/template.md)
 
 # Implementation
