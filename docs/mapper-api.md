@@ -498,6 +498,12 @@ What is refused, with the JSON path in the error and never a value: live fields 
 
 The mapping has no version, so vodnik makes one from what decides the output: the locations (a URL without its query, so a re-signed URL does not reload the asset), windows, tracks, overrides and subtitles, plus the size and modification time of every local file. The service has no ETag, so every revalidation fetches the mapping again and nothing is reloaded when the version is unchanged. `"cache": false` in a mapping gives it the shortest reuse window, `min_ttl_ms`. A `404` is a missing asset. The service cannot list its assets, so the admin panel shows only what is loaded, and `/admin/status` reports the `dialect`.
 
+### The DRM bridge
+
+A deployment that encrypts with nginx-vod-module asks a key service for each asset's DRM info rather than putting keys in the mapping. Add `[resolver.http.vod_module.drm]` and vodnik asks it too, on every revalidation, at `{base_url}/{path_template}?{extra_args}` with the mapper's bearer token (`path_template`, `extra_args` and `host_header` as for the mapping; `clear_lead_segments` leaves that many leading segments clear; `max_response_bytes` caps the answer). The design is [TDD 0018](technical-design/0018-drm-bridge.md).
+
+The service answers with a JSON array of one entry: `key` and `key_id` (base64, 16 bytes each) and a `pssh` list of `{uuid, data}`. `data` may be a complete `pssh` box for that system or its payload. The result is served as `cbcs`, the one scheme vodnik encrypts with; **nginx-vod-module serves DASH as `cenc` (AES-CTR), so a device that cannot decrypt `cbcs` cannot play it**. More than one entry, a malformed answer or a missing one is a `502`, an unreachable service a `503`, and an asset is never served clear because its key service failed. A key the service rotates reaches the asset at the next revalidation.
+
 ## What a `version` means to the server
 
 The server keeps one loaded copy per asset, keyed by `(asset_id, version)`. A different `version`, or the same version at a different location (a rotated signed URL), makes it reload from the new location. There is **no grace period**: players holding URLs from the old version get `404` and recover by fetching the playlist again. Change `version` only when the media actually changes.
