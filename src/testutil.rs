@@ -100,6 +100,37 @@ impl Answer {
         self
     }
 
+    /// Sets `key` on clip `position` of every rendition (TDD 0016), as a mapper that gives the
+    /// same clip the same keys in each rendition does.
+    pub(crate) fn with_every_rendition_clip_field(
+        mut self,
+        position: usize,
+        key: &str,
+        value: &Value,
+    ) -> Self {
+        for rendition in &mut self.renditions {
+            rendition["clips"][position][key] = value.clone();
+        }
+        self
+    }
+
+    /// Sets `key` on clip `position` of the rendition called `id`.
+    pub(crate) fn with_rendition_clip_field(
+        mut self,
+        id: &str,
+        position: usize,
+        key: &str,
+        value: Value,
+    ) -> Self {
+        let rendition = self
+            .renditions
+            .iter_mut()
+            .find(|rendition| rendition["id"] == id)
+            .expect("the answer has a rendition with this id");
+        rendition["clips"][position][key] = value;
+        self
+    }
+
     /// Sets `key` on the clip at `position` (TDD 0015).
     pub(crate) fn with_clip_field(mut self, position: usize, key: &str, value: Value) -> Self {
         self.clips[position][key] = value;

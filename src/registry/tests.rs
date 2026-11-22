@@ -7047,3 +7047,322 @@ async fn adaptive_aes128_segments_decrypt_to_the_clear_twin() {
     .await;
     assert!(checked >= 6, "{checked} segments checked");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Different keys per clip in an adaptive sequence (TDD 0016, stage 3)
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn each_clip_of_an_adaptive_sequence_has_its_own_key() {
+    let h = harness().await;
+    h.mapper.state.set(
+        "grid",
+        two_clip_ladder("v1")
+            .with_every_rendition_clip_field(0, "encryption", &clear_key_encryption(KEY))
+            .with_every_rendition_clip_field(1, "encryption", &clear_key_encryption_b()),
+    );
+    let master = fetch(&h.app, "/hls/grid/master.m3u8").await;
+    assert_eq!(master.0, StatusCode::OK, "{}", text(&master.2));
+    let version = version_in(&master.2);
+    // A player sees every licence the asset needs from the master alone.
+    let master_text = text(&master.2);
+    assert_eq!(
+        master_text.matches("#EXT-X-SESSION-KEY").count(),
+        2,
+        "{master_text}"
+    );
+
+    for track in ["video-720p", "video-480p", "audio-1"] {
+        let playlist = text(
+            &fetch(&h.app, &format!("/hls/grid/{track}/index.m3u8"))
+                .await
+                .2,
+        );
+        let keys = playlist
+            .lines()
+            .filter(|line| line.starts_with("#EXT-X-KEY"))
+            .collect::<Vec<_>>();
+        assert_eq!(keys.len(), 2, "{track}: {playlist}");
+        assert_ne!(keys[0], keys[1], "{track}: the clips use different keys");
+    }
+    let manifest = text(&fetch(&h.app, "/dash/grid/manifest.mpd").await.2);
+    assert!(
+        manifest.contains("01234567-89ab-cdef-0123-456789abcdef"),
+        "{manifest}"
+    );
+    assert!(
+        manifest.contains("fedcba98-7654-3210-fedc-ba9876543210"),
+        "{manifest}"
+    );
+    for clip in 0..2 {
+        let init = fetch(
+            &h.app,
+            &format!("/hls/grid/video-720p/clips/{clip}/init.mp4?v={version}"),
+        )
+        .await;
+        assert!(init.2.windows(4).any(|w| w == b"encv"), "clip {clip}");
+    }
+    let json: serde_json::Value =
+        serde_json::from_slice(&fetch(&h.app, "/admin/status").await.2).unwrap();
+    assert_eq!(
+        json["cache"]["assets"][0]["key_ids"],
+        serde_json::json!([
+            "01234567-89ab-cdef-0123-456789abcdef",
+            "fedcba98-7654-3210-fedc-ba9876543210"
+        ])
+    );
+    assert!(!json.to_string().contains(KEY) && !json.to_string().contains(KEY_B));
+}
+
+#[tokio::test]
+async fn an_adaptive_sequence_can_have_a_clear_clip_before_and_after_an_encrypted_one() {
+    let h = harness().await;
+    // Clip 0 is clear and clip 1 is encrypted; the answer's own `encryption` is not set.
+    h.mapper.state.set(
+        "grid",
+        two_clip_ladder("v1").with_every_rendition_clip_field(
+            1,
+            "encryption",
+            &clear_key_encryption(KEY),
+        ),
+    );
+    let master = fetch(&h.app, "/hls/grid/master.m3u8").await;
+    assert_eq!(master.0, StatusCode::OK, "{}", text(&master.2));
+    let version = version_in(&master.2);
+    let playlist = text(&fetch(&h.app, "/hls/grid/video-720p/index.m3u8").await.2);
+    let lines = playlist.lines().collect::<Vec<_>>();
+    let maps = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.starts_with("#EXT-X-MAP"))
+        .map(|(i, _)| i)
+        .collect::<Vec<_>>();
+    assert_eq!(maps.len(), 2, "{playlist}");
+    assert!(
+        lines[..maps[0]]
+            .iter()
+            .all(|l| !l.starts_with("#EXT-X-KEY")),
+        "the first clip is clear: {playlist}"
+    );
+    // The key is in force before the init segment it protects is declared.
+    assert!(lines[maps[1] - 1].starts_with("#EXT-X-KEY"), "{playlist}");
+    let clear_init = fetch(
+        &h.app,
+        &format!("/hls/grid/video-720p/clips/0/init.mp4?v={version}"),
+    )
+    .await;
+    let encrypted_init = fetch(
+        &h.app,
+        &format!("/hls/grid/video-720p/clips/1/init.mp4?v={version}"),
+    )
+    .await;
+    assert!(!clear_init.2.windows(4).any(|w| w == b"encv"));
+    assert!(encrypted_init.2.windows(4).any(|w| w == b"encv"));
+
+    // Encrypted, then clear: the playlist switches the key off again.
+    h.mapper.state.set(
+        "back",
+        two_clip_ladder("v1").with_every_rendition_clip_field(
+            0,
+            "encryption",
+            &clear_key_encryption(KEY),
+        ),
+    );
+    let playlist = text(&fetch(&h.app, "/hls/back/video-480p/index.m3u8").await.2);
+    assert!(playlist.contains("#EXT-X-KEY:METHOD=NONE"), "{playlist}");
+}
+
+#[tokio::test]
+async fn renditions_that_disagree_about_a_clips_keys_are_refused() {
+    let h = harness().await;
+    h.mapper.state.set(
+        "grid",
+        two_clip_ladder("v1").with_rendition_clip_field(
+            "720p",
+            0,
+            "encryption",
+            clear_key_encryption(KEY),
+        ),
+    );
+    assert_eq!(
+        status(&h.app, "/hls/grid/master.m3u8").await,
+        StatusCode::BAD_GATEWAY
+    );
+    h.mapper.state.set(
+        "other",
+        two_clip_ladder("v1")
+            .with_rendition_clip_field("720p", 0, "encryption", clear_key_encryption(KEY))
+            .with_rendition_clip_field("480p", 0, "encryption", clear_key_encryption_b()),
+    );
+    assert_eq!(
+        status(&h.app, "/hls/other/master.m3u8").await,
+        StatusCode::BAD_GATEWAY
+    );
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one asset, every rendition and every box checked in turn"
+)]
+async fn a_clips_own_key_periods_rotate_the_key_inside_the_clip_in_every_rendition() {
+    let h = harness().await;
+    // Both clips rotate, each on its own timeline: clear, then one key, then another. The
+    // first clip is one segment long, so only its first period is ever reached.
+    h.mapper.state.set(
+        "grid",
+        two_clip_ladder("v1")
+            .with_every_rendition_clip_field(0, "encryption", &rotating_encryption())
+            .with_every_rendition_clip_field(1, "encryption", &rotating_encryption()),
+    );
+    let master = fetch(&h.app, "/hls/grid/master.m3u8").await;
+    assert_eq!(master.0, StatusCode::OK, "{}", text(&master.2));
+    let version = version_in(&master.2);
+    for track in ["video-720p", "video-480p", "audio-1"] {
+        let playlist = text(
+            &fetch(&h.app, &format!("/hls/grid/{track}/index.m3u8"))
+                .await
+                .2,
+        );
+        let lines = playlist.lines().collect::<Vec<_>>();
+        let position = |prefix: &str, nth: usize| {
+            lines
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| line.starts_with(prefix))
+                .nth(nth)
+                .map(|(at, _)| at)
+        };
+        let keys = lines
+            .iter()
+            .filter(|line| line.starts_with("#EXT-X-KEY"))
+            .count();
+        assert_eq!(
+            keys, 2,
+            "{track}: one line per period that has keys\n{playlist}"
+        );
+        assert!(
+            !playlist.contains("METHOD=NONE"),
+            "{track}: both clips start clear\n{playlist}"
+        );
+        // Clip 1 starts clear: its first segment (global 1) comes before any of its keys, and
+        // the two keys go before its second and third segments, not before its first.
+        let second_map = position("#EXT-X-MAP", 1).expect("two clips");
+        let first_key = position("#EXT-X-KEY", 0).expect("a key");
+        let second_key = position("#EXT-X-KEY", 1).expect("a second key");
+        let first_extinf_after_map = lines[second_map..]
+            .iter()
+            .position(|line| line.starts_with("#EXTINF"))
+            .map(|at| at + second_map)
+            .unwrap();
+        assert!(
+            first_extinf_after_map < first_key && first_key < second_key,
+            "{track}: keys follow their own clip's segments\n{playlist}"
+        );
+        assert!(
+            lines[first_key + 1].starts_with("#EXTINF"),
+            "{track}\n{playlist}"
+        );
+    }
+    // One init segment per clip carries the rotation, not one per period.
+    let init = fetch(
+        &h.app,
+        &format!("/hls/grid/video-720p/clips/1/init.mp4?v={version}"),
+    )
+    .await;
+    assert!(init.2.windows(4).any(|w| w == b"encv"));
+    // Clip 1 is clear for its first segment (global 1), then under one key, then another.
+    let segment = |number: u32| {
+        let h = &h;
+        let version = &version;
+        async move {
+            fetch(
+                &h.app,
+                &format!("/hls/grid/video-720p/segments/{number}/media.m4s?v={version}"),
+            )
+            .await
+            .2
+        }
+    };
+    let boxes = |bytes: &Bytes| box_names(&child_boxes(bytes, &[b"moof", b"traf"]));
+    assert_eq!(
+        boxes(&segment(1).await),
+        ["tfhd", "tfdt", "trun", "sgpd", "sbgp"],
+        "clear: a `seig` group and no encryption boxes"
+    );
+    assert_eq!(
+        boxes(&segment(2).await),
+        ["tfhd", "tfdt", "trun", "senc", "saiz", "saio"],
+        "under the init segment's own key"
+    );
+    assert_eq!(
+        boxes(&segment(3).await),
+        [
+            "tfhd", "tfdt", "trun", "senc", "saiz", "saio", "sgpd", "sbgp"
+        ],
+        "under the next key, which it names"
+    );
+    // Each key line names its own period's key, and the master offers both licences up front.
+    let playlist = text(&fetch(&h.app, "/hls/grid/video-720p/index.m3u8").await.2);
+    let key_lines = playlist
+        .lines()
+        .filter(|line| line.starts_with("#EXT-X-KEY"))
+        .collect::<Vec<_>>();
+    assert!(
+        key_lines[0].contains(&format!("KEYID=0x{KEY_ID}")),
+        "{playlist}"
+    );
+    assert!(
+        key_lines[1].contains(&format!("KEYID=0x{KEY_ID_B}")),
+        "{playlist}"
+    );
+    let master = text(&master.2);
+    assert_eq!(master.matches("#EXT-X-SESSION-KEY").count(), 2, "{master}");
+    let manifest = text(&fetch(&h.app, "/dash/grid/manifest.mpd").await.2);
+    assert_eq!(manifest.matches("<Period ").count(), 2, "{manifest}");
+    assert!(
+        manifest.contains("cenc:default_KID=\"01234567-89ab-cdef-0123-456789abcdef\""),
+        "{manifest}"
+    );
+}
+
+#[tokio::test]
+async fn a_rotating_clip_followed_by_a_clear_one_switches_the_key_off() {
+    let h = harness().await;
+    // Clip 0 is the long one here: one segment is clear, the rest are under keys; clip 1 is
+    // clear, so the playlist must say so.
+    h.mapper.state.set(
+        "grid",
+        Answer::renditions_with_clips(
+            "v1",
+            &[
+                (
+                    "720p",
+                    &[
+                        clip("rendition-720p.mp4", Some(1000), None),
+                        clip("rendition-720p.mp4", None, Some(1000)),
+                    ],
+                ),
+                (
+                    "480p",
+                    &[
+                        clip("rendition-480p.mp4", Some(1000), None),
+                        clip("rendition-480p.mp4", None, Some(1000)),
+                    ],
+                ),
+            ],
+        )
+        .with_every_rendition_clip_field(0, "encryption", &rotating_encryption()),
+    );
+    let playlist = text(&fetch(&h.app, "/hls/grid/video-720p/index.m3u8").await.2);
+    let lines = playlist.lines().collect::<Vec<_>>();
+    let none = lines
+        .iter()
+        .position(|line| line.starts_with("#EXT-X-KEY:METHOD=NONE"))
+        .unwrap_or_else(|| panic!("the clear clip switches the key off\n{playlist}"));
+    let second_map = lines
+        .iter()
+        .rposition(|line| line.starts_with("#EXT-X-MAP"))
+        .unwrap();
+    assert!(none < second_map, "{playlist}");
+}

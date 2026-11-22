@@ -1,6 +1,6 @@
 # TDD 0013: Key rotation within an asset
 
-- Status: Accepted; implemented for single-file and adaptive assets
+- Status: Accepted; implemented for single-file and adaptive assets, and for the clips of an adaptive sequence
 - Created: 2026-10-07
 - Updated: 2026-10-10
 - Related ADRs: [ADR 0001](../adr/0001-use-fragmented-mp4-for-media-segments.md)
