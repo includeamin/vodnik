@@ -287,13 +287,6 @@ impl WireEncryption {
         };
         let mut encryption = self.validate_keys()?;
         if dash_scheme == Scheme::Cenc {
-            // A clear stretch before or between uses of one key needs nothing more than `cbcs`
-            // does; a change of key needs a sample group `cenc` does not write yet (TDD 0021).
-            if encryption.key_ids().len() > 1 {
-                return Err(
-                    "encryption dash_scheme cenc cannot change keys between periods".to_owned(),
-                );
-            }
             encryption.dash_scheme = Scheme::Cenc;
             for period in &mut encryption.periods {
                 if let Some(content) = &mut period.encryption {
@@ -1023,17 +1016,28 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_dash_scheme_or_cenc_with_a_key_change_is_refused() {
+    fn an_unknown_dash_scheme_is_refused() {
         let error = wire(&one_key(r#","dash_scheme":"cbc1""#))
             .validate()
             .unwrap_err();
         assert!(error.contains("dash_scheme must be"), "{error}");
+    }
+
+    #[test]
+    fn cenc_allows_the_keys_to_change_between_periods() {
         let periods = format!(
             r#"{{"scheme":"cbcs","dash_scheme":"cenc","periods":[{{"start_ms":0,"keys":[{{"key_id":"{KID}","key":"{KEY}"}}]}},{{"start_ms":1000,"keys":[{{"key_id":"fedcba9876543210fedcba9876543210","key":"{KEY}"}}]}}]}}"#
         );
-        let error = wire(&periods).validate().unwrap_err();
-        assert!(error.contains("cannot change keys"), "{error}");
-        assert!(!error.contains(KEY), "an error never carries a key");
+        let rotating = wire(&periods).validate().unwrap();
+        assert_eq!(rotating.key_ids().len(), 2);
+        for period in &rotating.periods {
+            let content = period.encryption.as_ref().unwrap();
+            assert_eq!(
+                content.dash_scheme,
+                Scheme::Cenc,
+                "every period is cenc on DASH"
+            );
+        }
     }
 
     #[test]

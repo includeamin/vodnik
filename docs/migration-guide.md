@@ -18,7 +18,7 @@ Go through your `nginx.conf` and a sample of mapping responses, and mark which o
 | Language and label of audio sequences, `tracks` | Translated |
 | Subtitles (`.vtt`, `.srt`, `.ttml`, `.dfxp` sequences) | Translated; see [supported input](supported-input.md) for the formats |
 | `vod_drm_upstream_location` with AES-CBC / `cbcs` | The DRM bridge: [TDD 0018](technical-design/0018-drm-bridge.md) |
-| `vod_drm_upstream_location` with AES-CTR / `cenc` | `dash_scheme = "cenc"`: DASH as AES-CTR, HLS as `cbcs`; [TDD 0021](technical-design/0021-cenc-for-dash.md). A change of key part way through an asset is not covered |
+| `vod_drm_upstream_location` with AES-CTR / `cenc` | `dash_scheme = "cenc"`: DASH as AES-CTR, HLS as `cbcs`; [TDD 0021](technical-design/0021-cenc-for-dash.md). Key rotation and a clear lead work |
 | HLS AES-128 | Native: [TDD 0012](technical-design/0012-hls-aes-128.md) |
 | `vod_fallback_upstream_location` | `[fallback]`: [TDD 0020](technical-design/0020-fallback-on-miss.md) |
 | Live or simulated live (`playlistType` other than `vod`) | **Not supported** |

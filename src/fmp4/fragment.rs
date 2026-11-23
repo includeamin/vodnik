@@ -342,7 +342,8 @@ pub(crate) struct FragmentRotation {
     pub(crate) pssh: Vec<u8>,
 }
 
-/// A `seig` entry (ISO/IEC 23001-7, 6.1) for a `cbcs` track with a constant IV.
+/// A `seig` entry (ISO/IEC 23001-7, 6.1): for `cbcs` a track with a constant IV, for `cenc` one
+/// whose samples each carry their own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SampleGroup {
     Clear,
@@ -350,6 +351,8 @@ pub(crate) enum SampleGroup {
         crypt_byte_block: u8,
         skip_byte_block: u8,
         key_id: [u8; 16],
+        /// `0` for `cbcs`, which declares `constant_iv`; `8` for `cenc`, which declares none.
+        per_sample_iv_size: u8,
         constant_iv: [u8; 16],
     },
 }
@@ -366,13 +369,16 @@ fn sample_group_boxes(group: &SampleGroup, sample_count: u32) -> Result<Vec<u8>>
             crypt_byte_block,
             skip_byte_block,
             key_id,
+            per_sample_iv_size,
             constant_iv,
         } => {
             entry.push((crypt_byte_block << 4) | (skip_byte_block & 0x0f));
-            entry.extend_from_slice(&[1, 0]);
+            entry.extend_from_slice(&[1, *per_sample_iv_size]);
             entry.extend_from_slice(key_id);
-            entry.push(16);
-            entry.extend_from_slice(constant_iv);
+            if *per_sample_iv_size == 0 {
+                entry.push(16);
+                entry.extend_from_slice(constant_iv);
+            }
         }
     }
     let entry_length = u32::try_from(entry.len())

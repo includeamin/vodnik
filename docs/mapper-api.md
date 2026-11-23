@@ -340,7 +340,7 @@ An answer may carry an `encryption` object. vodnik then encrypts what it serves 
 | Field | Rules |
 | --- | --- |
 | `scheme` | `cbcs`. Anything else is rejected |
-| `dash_scheme` | Optional: `cbcs` (the default) or `cenc`. With `cenc`, DASH init and media segments are AES-CTR (`cenc`) with a per-sample IV, and the DASH manifest says so; HLS stays `cbcs`. A clear lead works with it, but not a change of key between periods ([TDD 0021](technical-design/0021-cenc-for-dash.md)) |
+| `dash_scheme` | Optional: `cbcs` (the default) or `cenc`. With `cenc`, DASH init and media segments are AES-CTR (`cenc`) with a per-sample IV, and the DASH manifest says so; HLS stays `cbcs`. Clear periods and key rotation work with it ([TDD 0021](technical-design/0021-cenc-for-dash.md)) |
 | `keys` | One entry with `"tracks": "all"` (or no `tracks`), or one `"video"` and one `"audio"` entry, for example `{ "tracks": "video", … }, { "tracks": "audio", … }`. Every track of the asset must end up with exactly one key. FairPlay needs one key for all tracks: an answer listing FairPlay with separate video and audio keys is rejected |
 | `key_id`, `key` | 16 bytes each, as 32 hex digits |
 | `iv` | Optional, 16 bytes as 32 hex digits: the constant IV declared in the init segment. When absent, it is the first 16 bytes of SHA-256(`"vodnik cbcs iv"` followed by `key_id`), so every replica derives the same one. It is never derived from the key |

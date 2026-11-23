@@ -29,6 +29,9 @@ pub(crate) struct TrackProtection {
     /// What a fragment under this key says about it when the key is not the init segment's
     /// (TDD 0013).
     pub(crate) rotation: Option<Arc<FragmentRotation>>,
+    /// The same for a `cenc` fragment, whose group declares a per-sample IV size and no constant
+    /// IV (TDD 0021). Present only when the asset asks for `cenc` on DASH.
+    pub(crate) cenc_rotation: Option<Arc<FragmentRotation>>,
     /// What `cenc` derives a sample's IV from, together with where the sample is (TDD 0021). It
     /// names the asset's version, so two assets that share a key never share a keystream.
     iv_salt: [u8; 32],
@@ -210,22 +213,36 @@ impl AssetProtection {
                 kind: track.kind,
                 video,
                 rotation: None,
+                cenc_rotation: None,
                 iv_salt: hasher.finalize().into(),
             };
             if rotating {
-                let group = (protection.key != *primary.key_for(track.kind)).then(|| {
+                let changed = protection.key != *primary.key_for(track.kind);
+                let pssh = system_pssh(period).concat();
+                let group = changed.then(|| {
                     let pattern = protection.pattern();
                     SampleGroup::Protected {
                         crypt_byte_block: pattern.crypt,
                         skip_byte_block: pattern.skip,
                         key_id: protection.key.key_id,
+                        per_sample_iv_size: 0,
                         constant_iv: protection.key.iv,
                     }
                 });
                 protection.rotation = Some(Arc::new(FragmentRotation {
                     group,
-                    pssh: system_pssh(period).concat(),
+                    pssh: pssh.clone(),
                 }));
+                if primary.dash_scheme == Scheme::Cenc {
+                    let group = changed.then_some(SampleGroup::Protected {
+                        crypt_byte_block: 0,
+                        skip_byte_block: 0,
+                        key_id: protection.key.key_id,
+                        per_sample_iv_size: 8,
+                        constant_iv: [0; 16],
+                    });
+                    protection.cenc_rotation = Some(Arc::new(FragmentRotation { group, pssh }));
+                }
             }
             protected.insert(track.id, Arc::new(protection));
         }
@@ -482,7 +499,10 @@ impl PendingCbcs {
             &maps,
             &ivs,
             payload.len(),
-            self.protection.rotation.as_deref(),
+            match self.scheme {
+                Scheme::Cbcs => self.protection.rotation.as_deref(),
+                Scheme::Cenc => self.protection.cenc_rotation.as_deref(),
+            },
         )?;
         // Put the header in front within the payload's own buffer (room is usually reserved by
         // the caller), rather than copying the whole payload after the header.

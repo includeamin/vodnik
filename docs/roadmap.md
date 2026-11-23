@@ -37,7 +37,7 @@ DRM is the most common reason a studio-licensed catalog cannot move. These steps
 | Decrypting CENC-encrypted source files | Stages 1 and 2 done | [TDD 0014](technical-design/0014-encrypted-source-files.md): a single file, progressive or fragmented, `cenc`, `cens`, `cbc1` and `cbcs`, decrypted with keys from the mapper's `source_encryption`, then clear or encrypted again. Still to do: adaptive assets and sequences, and passing a source's protection through. A wrong key can be caught only when the file's NAL lengths are encrypted |
 | AV1 and VP9 encryption | To do | OBU-aware and superframe-aware subsample rules |
 | Opus and FLAC encryption | To do | Whole-sample protection, as for AAC |
-| `cenc` (AES-CTR) scheme | DASH done | [TDD 0021](technical-design/0021-cenc-for-dash.md): `dash_scheme = "cenc"` serves DASH as AES-CTR while HLS stays `cbcs`; decrypted by FFmpeg, not yet tried on a device. A change of key part way through an asset is not covered, and `cenc` over HLS is not offered |
+| `cenc` (AES-CTR) scheme | DASH done | [TDD 0021](technical-design/0021-cenc-for-dash.md): `dash_scheme = "cenc"` serves DASH as AES-CTR while HLS stays `cbcs`; decrypted by FFmpeg, not yet tried on a device. Key rotation and a clear lead work; `cenc` over HLS is not offered |
 | SPEKE v2 key exchange | To do, mapper side | vodnik never talks to a licence server, so this is a reference mapper adapter and guide, not server code |
 | Widevine, FairPlay, PlayReady playback on real devices | To do | Manual release check with an operator's DRM vendor account; only Clear Key is verified in browsers today |
 
