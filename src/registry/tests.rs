@@ -2755,12 +2755,13 @@ async fn decode_each(
             "clip {position}: {}",
             String::from_utf8_lossy(&decode.stderr)
         );
-        counts.push(
-            String::from_utf8_lossy(&count.stdout)
-                .trim()
-                .parse()
-                .unwrap(),
-        );
+        let stdout = String::from_utf8_lossy(&count.stdout);
+        counts.push(stdout.trim().parse().unwrap_or_else(|_| {
+            panic!(
+                "clip {position}: ffprobe did not give a frame count: stdout {stdout:?}, stderr {:?}",
+                String::from_utf8_lossy(&count.stderr)
+            )
+        }));
     }
     counts
 }
