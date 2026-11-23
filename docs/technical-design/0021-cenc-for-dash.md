@@ -1,6 +1,6 @@
 # TDD 0021: `cenc` (AES-CTR) for DASH
 
-- Status: Accepted; implemented
+- Status: Accepted; implemented, including key rotation
 - Created: 2026-11-23
 - Updated: 2026-11-23
 - Related ADRs: None
@@ -27,7 +27,6 @@ TDD 0009 chose `cbcs` because it is the one scheme every major DRM system accept
 
 - `cenc` over HLS (`SAMPLE-AES-CTR`): few players read it.
 - `cens` and `cbc1`.
-- Changing keys part way through a `cenc` asset. A clear lead, or clear stretches between uses of one key, work; a change of key does not (see [Key periods](#key-periods)).
 
 ## Design
 
@@ -56,7 +55,9 @@ Replicas must agree, so an IV cannot be random. It is the first 8 bytes of SHA-2
 
 ### Key periods
 
-A clear lead (`clear_lead_ms`, or `periods` that are clear then one key) works. The clear fragments say they are clear with a `seig` group, which has no IV and so needs nothing `cenc`-specific, and the encrypted ones are ordinary `cenc` fragments. **A change of key between periods is refused** when `dash_scheme` is `cenc`: a fragment under another key needs a `seig` group that declares a per-sample IV size instead of a constant IV, and that is not written yet. Refusing is the safe choice; a `502` names the reason, and no asset is ever served clear because of it.
+Key rotation and clear periods (TDD 0013) work under `cenc` as they do under `cbcs`. The init segment declares the first encrypted period's key. A fragment under another key says so with a `seig` sample group, and a clear fragment says it is clear with one; each period's `pssh` boxes go in its fragments' `moof`.
+
+The one difference is what a protected group declares. `cbcs` says "protected, 1:9 pattern, constant IV" and carries the 16-byte IV. `cenc` says "protected, no pattern, per-sample IV size 8" and carries no IV, since each sample's own IV is in `senc`. A fragment is given the group that matches the scheme it is encrypted with, so the same period is a `cbcs` entry over HLS and a `cenc` entry over DASH. The key itself is the same.
 
 ### Signalling
 
@@ -67,13 +68,13 @@ The DASH `ContentProtection` for `urn:mpeg:dash:mp4protection:2011` says `value=
 - The CTR mode against NIST SP 800-38A's vector, across ranges split at arbitrary points, and as an IV followed by a block count from zero.
 - The init segment's `schm` and `tenc`, and a fragment's `senc`, `saiz` and `saio` for video and audio.
 - The setting: default, `cenc`, an unknown value, a key change, a clear lead; the version it changes.
+- Rotation: over DASH the clear fragment says it is clear, the init segment's key needs no group, and a new key's fragment carries a 20-byte `seig` entry (protected, IV size 8, key ID, no constant IV) while the same fragment over HLS carries the 37-byte `cbcs` entry. FFmpeg decodes each encrypted period under its own key and fails under the other's.
 - End to end: DASH and HLS inits and segments of one asset carry different schemes; every sample has a distinct IV; segments are repeatable; clips and adaptive sets follow the rule.
 - **FFmpeg decryption.** FFmpeg decodes the served DASH video and audio as `cenc` with every frame, fails with a wrong key and without one, and still decodes HLS as `cbcs`. This is an independent implementation of the cipher, the subsample handling and the boxes.
 
-Two limits of that evidence. FFmpeg cannot read a clear fragment inside an encrypted track (it tries to decrypt it; `cbcs` behaves the same), so the clear lead is checked by structure, and FFmpeg decodes only what follows it. And FFmpeg is not a DRM client: the real test is a device.
+Three limits of that evidence. FFmpeg cannot read a clear fragment inside an encrypted track (it tries to decrypt it; `cbcs` behaves the same), so a clear lead is checked by structure, and FFmpeg decodes only what follows it. FFmpeg also takes one key for a stream and does not follow `seig` groups, so each encrypted period is decoded on its own, after the init segment, under that period's key; a player that follows the groups is not tested here. And FFmpeg is not a DRM client: the real test is a device.
 
 ## Open questions
 
-- A change of key under `cenc` (a `seig` group with a per-sample IV size).
 - `cenc` for HLS, if a device ever needs it.
 - Playback on the real devices that motivated this.

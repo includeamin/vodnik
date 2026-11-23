@@ -8196,7 +8196,7 @@ async fn cenc_for_dash_works_for_clips_and_adaptive_sets_too() {
 }
 
 #[tokio::test]
-async fn cenc_for_dash_may_start_with_a_clear_lead_but_not_change_keys() {
+async fn cenc_for_dash_may_start_with_a_clear_lead() {
     let h = harness().await;
     let mut lead = clear_key_encryption(KEY);
     lead["dash_scheme"] = serde_json::json!("cenc");
@@ -8214,7 +8214,6 @@ async fn cenc_for_dash_may_start_with_a_clear_lead_but_not_change_keys() {
         "{mpd}"
     );
 
-    // The first segment is clear, the rest are cenc: ffmpeg decodes all of it with the key.
     let first = fetch(
         &h.app,
         &format!("/dash/lead/video/segments/0/media.m4s?v={version}"),
@@ -8233,22 +8232,126 @@ async fn cenc_for_dash_may_start_with_a_clear_lead_but_not_change_keys() {
         find_box_payload(&second.2, *b"senc").is_some(),
         "after the lead it is encrypted"
     );
+}
 
-    let mut rotating = clear_key_encryption(KEY);
+/// The `seig` entry of a fragment: its bytes after the group's length, or `None` without one.
+fn seig_entry(fragment: &[u8]) -> Option<Vec<u8>> {
+    let sgpd = find_box_payload(fragment, *b"sgpd")?;
+    // Version and flags, `seig`, the default length, the entry count, then the entry.
+    let length = u32::from_be_bytes(fragment[sgpd + 8..sgpd + 12].try_into().unwrap()) as usize;
+    Some(fragment[sgpd + 16..sgpd + 16 + length].to_vec())
+}
+
+#[tokio::test]
+async fn cenc_for_dash_says_which_key_protects_each_fragment_without_a_constant_iv() {
+    let h = harness().await;
+    let mut rotating = rotating_encryption();
     rotating["dash_scheme"] = serde_json::json!("cenc");
-    rotating["keys"] = serde_json::json!([]);
-    rotating["periods"] = serde_json::json!([
-        {"start_ms": 0, "keys": [{"key_id": KEY_ID, "key": KEY}]},
-        {"start_ms": 1000, "keys": [{"key_id": KEY_ID_B, "key": KEY_B}]},
-    ]);
     h.mapper.state.set(
-        "rotating",
+        "rot",
         Answer::file("v1", "h264-aac.mp4").with_encryption(rotating),
     );
-    assert_eq!(
-        status(&h.app, "/dash/rotating/manifest.mpd").await,
-        StatusCode::BAD_GATEWAY
+    let master = fetch(&h.app, "/hls/rot/master.m3u8").await;
+    assert_eq!(master.0, StatusCode::OK, "{}", text(&master.2));
+    let version = version_in(&master.2);
+    let segment = |protocol: &'static str, n: u32| {
+        let h = &h;
+        let version = version.clone();
+        async move {
+            fetch(
+                &h.app,
+                &format!("/{protocol}/rot/video/segments/{n}/media.m4s?v={version}"),
+            )
+            .await
+            .2
+        }
+    };
+
+    // The init segment names the first encrypted period's key, so segment 1 needs no group.
+    let dash = [
+        segment("dash", 0).await,
+        segment("dash", 1).await,
+        segment("dash", 2).await,
+    ];
+    let clear = seig_entry(&dash[0]).expect("a clear fragment says so");
+    assert_eq!(&clear[..4], &[0, 0, 0, 0], "not protected");
+    assert!(find_box_payload(&dash[0], *b"senc").is_none());
+    assert!(
+        seig_entry(&dash[1]).is_none(),
+        "the init segment's key needs no group"
     );
+    assert!(find_box_payload(&dash[1], *b"senc").is_some());
+
+    let changed = seig_entry(&dash[2]).expect("a new key says so");
+    assert_eq!(changed.len(), 20, "a cenc entry has no constant IV");
+    assert_eq!(
+        &changed[..4],
+        &[0, 0, 1, 8],
+        "protected, eight-byte IVs, no pattern"
+    );
+    assert_eq!(&changed[4..20], &hex_bytes(KEY_ID_B), "the new key's ID");
+    assert!(
+        find_box_payload(&dash[2], *b"senc").is_some(),
+        "its samples carry IVs"
+    );
+
+    // HLS is unchanged: the same fragment declares a constant IV.
+    let hls = seig_entry(&segment("hls", 2).await).expect("HLS names the key too");
+    assert_eq!(hls.len(), 37, "a cbcs entry carries its constant IV");
+    assert_eq!(&hls[..4], &[0, 0x19, 1, 0]);
+}
+
+#[tokio::test]
+async fn ffmpeg_decodes_each_cenc_period_under_its_own_key() {
+    if std::process::Command::new("ffprobe")
+        .arg("-version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipping: ffprobe is not installed");
+        return;
+    }
+    let h = harness().await;
+    let mut rotating = rotating_encryption();
+    rotating["dash_scheme"] = serde_json::json!("cenc");
+    h.mapper.state.set(
+        "rot",
+        Answer::file("v1", "h264-aac.mp4").with_encryption(rotating),
+    );
+    let version = version_in(&fetch(&h.app, "/hls/rot/master.m3u8").await.2);
+    let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/cenc-rotate");
+    // FFmpeg reads one key for a whole stream, so each encrypted period is decoded on its own,
+    // after the init segment: the segment it starts with is a key frame.
+    for (segment, key, frames) in [(1u32, KEY, 30u64), (2, KEY_B, 30)] {
+        let clips = vec![(
+            format!("init.mp4?v={version}"),
+            vec![format!("segments/{segment}/media.m4s?v={version}")],
+        )];
+        let decoded = decode_each(
+            &h.app,
+            "/dash/rot/video/",
+            &clips,
+            &directory.join(format!("segment-{segment}")),
+            Some(key),
+        )
+        .await;
+        assert_eq!(decoded, [frames], "segment {segment} under its own key");
+    }
+    // Under the other period's key the picture is not recovered.
+    let clips = vec![(
+        format!("init.mp4?v={version}"),
+        vec![format!("segments/2/media.m4s?v={version}")],
+    )];
+    let path = directory.join("wrong").join("clip-0.mp4");
+    let _ = decode_each(
+        &h.app,
+        "/dash/rot/video/",
+        &clips,
+        &directory.join("wrong"),
+        Some(KEY_B),
+    )
+    .await;
+    assert_ne!(decode_errors(&path, Some(KEY)), "", "the wrong key fails");
 }
 
 #[tokio::test]

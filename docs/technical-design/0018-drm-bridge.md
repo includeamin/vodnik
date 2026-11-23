@@ -111,6 +111,6 @@ Additive: without `[resolver.http.vod_module.drm]` nothing changes, and rollback
 ## Open questions
 
 - **`pssh.data` and the answer's exact shape.** Confirm against a real answer; adapt the translation if a deployment's differs.
-- **`cenc`.** Done in [TDD 0021](0021-cenc-for-dash.md): `dash_scheme = "cenc"` serves DASH as AES-CTR and HLS stays `cbcs`. A change of key is not covered.
+- **`cenc`.** Done in [TDD 0021](0021-cenc-for-dash.md): `dash_scheme = "cenc"` serves DASH as AES-CTR and HLS stays `cbcs`. Key rotation and a clear lead work with it.
 - **Several keys.** A deployment that uses separate video and audio keys would need `keys` with `tracks`, and a way to tell which entry is which.
 - **The clear lead default.** `0` here; nginx-vod-module's own default is not known from its public documentation.
